@@ -235,7 +235,7 @@ def processing_task():
 # Global variables to track our steering state machine
 steering_state = 0       # 0 = Idle, 1 = Tapping, 2 = Resetting
 tap_loop_count = 0       # Counts how many loops we hold the steering wheel
-current_lane = 0         # Tracks our car's actual lane position (-1, 0, 1)
+current_lane = 0         # Tracks our car's actual lane position (-2, -1, 0, 1, 2)
 def send_controls_task():
     global control_conn, steering_state, tap_loop_count, current_lane
     
@@ -272,7 +272,10 @@ def send_controls_task():
         if tap_loop_count >= 10:
             steering_state = 2  # Turn finished, proceed to reset step
             tap_loop_count = 0  # Reset counter
-            current_lane = target_lane # Update our position tracker
+            if target_lane > current_lane:
+                current_lane += 1
+            elif target_lane < current_lane:
+                current_lane -= 1
             
     elif steering_state == 2:
         # STATE 2: RESETTING (Force wheel back to center before doing anything else)
@@ -301,20 +304,13 @@ if __name__ == '__main__':
         time.sleep(5) # Wait for the simulator to fully launch and connect
         
         while is_running:
-            print("\n--- [TEST] Simulating: Green Token on Right Lane! ---")
-            with data_lock:
-                shared_data['target_lane'] = 1  # Tell your control thread to move Right
-            time.sleep(4)
-            
-            print("\n--- [TEST] Simulating: Green Token on Left Lane! ---")
-            with data_lock:
-                shared_data['target_lane'] = -1 # Tell your control thread to move Left
-            time.sleep(4)
-            
-            print("\n--- [TEST] Simulating: Moving back to Center Lane! ---")
-            with data_lock:
-                shared_data['target_lane'] = 0  # Tell your control thread to move to Center
-            time.sleep(4)
+            for lane in [2, 1, 0, -1, -2, 0]:
+                print(f"\n--- [TEST] Simulating: Move to lane {lane} ---")
+                with data_lock:
+                    shared_data['target_lane'] = lane
+                time.sleep(4)
+
+    ENABLE_LANE_SWITCH_TEST = True
 
     print("Initializing RTSE Sample Drive...")
 
@@ -342,6 +338,10 @@ if __name__ == '__main__':
     t_back_camera.start()
     t_processing.start()
     t_controls.start()
+
+    if ENABLE_LANE_SWITCH_TEST:
+        threading.Thread(target=mock_team_a_tester, daemon=True).start()
+        print("[TEST] Lane switch test mode enabled. Watch for control state-machine messages.")
     
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
