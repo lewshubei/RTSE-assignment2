@@ -92,14 +92,6 @@ YELLOW_EFFECTS = [
     'corrupted_camera_input'
 ]
 
-# Yellow avoidance tunables
-# Yellow tokens are treated as hazards, not bonus targets.
-YELLOW_STRICT_AVOID = True
-YELLOW_HAZARD_Y_MIN_RATIO = 0.18
-YELLOW_CLOSE_Y_RATIO = 0.55
-YELLOW_ADJACENT_BUFFER_Y_RATIO = 0.72
-YELLOW_LANE_BLOCK_SCORE = 100.0
-
 # Light detection tunables - SUPER FAST RECOVERY
 LOWLIGHT_DARK_THRESHOLD = 0.55  # More sensitive detection
 LOWLIGHT_RECOVERY_THRESHOLD = 0.65  # Faster recovery detection
@@ -251,10 +243,6 @@ shared_data = {
     'police_detection_history': [],
     'police_lane': None,
     'trailing_lane': None,
-    'police_bbox': None,
-    'trailing_bbox': None,
-    'police_last_seen_time': 0.0,
-    'trailing_last_seen_time': 0.0,
     'emergency_evasion': False,
     'evasion_target_lane': None,
     'evasion_start_time': 0.0,
@@ -499,27 +487,6 @@ def adjust_gamma(image, gamma=1.5):
     table = np.array([((i/255.0) ** invGamma) * 255
                       for i in np.arange(256)]).astype("uint8")
     return cv2.LUT(image, table)
-
-def token_in_front_danger_zone(token, frame_width, frame_height):
-    """
-    Checks whether a token is directly in front of the player's vehicle.
-    This is used as an emergency collision check for red/yellow tokens.
-    """
-    y = token['y']
-    x = token['x']
-
-    # Only check tokens close to the vehicle
-    if y < frame_height * 0.55:
-        return False
-
-    y_ratio = y / frame_height
-
-    # Danger zone becomes wider near the bottom of the screen
-    half_width_ratio = 0.07 + 0.13 * ((y_ratio - 0.55) / 0.40)
-    half_width_ratio = max(0.07, min(0.20, half_width_ratio))
-
-    center_x = frame_width / 2.0
-    return abs(x - center_x) <= frame_width * half_width_ratio
 
 def detect_token_color_robust(frame, x, y, radius):
     x1 = max(int(x - radius), 0)
@@ -925,43 +892,6 @@ def draw_detected_tokens(frame, tokens):
     cv2.addWeighted(overlay, alpha, display_frame, 1-alpha, 0, display_frame)
     return display_frame
 
-<<<<<<< HEAD
-def draw_vehicle_box(display_frame, bbox, source_shape, label, lane=None, confidence=None, color=(255, 255, 255)):
-    """
-    Draw a scaled vehicle bounding box on the display frame.
-    bbox must come from the original camera frame as (x, y, w, h).
-    """
-    if bbox is None or source_shape is None:
-        return display_frame
-
-    src_h, src_w = source_shape[:2]
-    dst_h, dst_w = display_frame.shape[:2]
-    if src_w <= 0 or src_h <= 0:
-        return display_frame
-
-    scale_x = dst_w / float(src_w)
-    scale_y = dst_h / float(src_h)
-
-    x, y, w, h = bbox
-    x1 = int(max(0, min(dst_w - 1, x * scale_x)))
-    y1 = int(max(0, min(dst_h - 1, y * scale_y)))
-    x2 = int(max(0, min(dst_w - 1, (x + w) * scale_x)))
-    y2 = int(max(0, min(dst_h - 1, (y + h) * scale_y)))
-
-    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 3)
-
-    label_parts = [label]
-    if lane is not None:
-        label_parts.append(f"Lane {lane}")
-    if confidence is not None:
-        label_parts.append(f"{confidence:.2f}")
-    text = " | ".join(label_parts)
-
-    text_y = y1 - 10 if y1 > 25 else y2 + 25
-    cv2.putText(display_frame, text, (x1, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    return display_frame
-=======
 def make_lane_boundary(line_params, y_bottom, y_top):
     slope, intercept = line_params
     if abs(slope) < 0.001:
@@ -1317,7 +1247,6 @@ def draw_yolo_vehicle_overlay(frame, vehicles):
         cv2.putText(frame, label, (x, max(18, y - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
     return frame
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
 
 def lane_from_x(x, y=None, frame_width=640, frame_height=480):
     if y is None:
@@ -1699,30 +1628,11 @@ def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane
         if token_lane != current_lane and not token_is_centered:
             continue
 
-<<<<<<< HEAD
-        # Avoid yellow tokens completely. Red is only allowed during police-active mode.
-        true_color = token.get('true_color', token.get('color'))
-
-        if true_color not in ['green', 'red', 'yellow']:
-            true_color = detect_token_color_robust(front_frame, token['x'], token['y'], token['radius'])
-
-        with data_lock:
-            police_active_now = shared_data.get('police_active', False)
-
-        if true_color == 'yellow':
-            continue
-
-        if true_color == 'red' and not police_active_now:
-            continue
-
-        if true_color not in ['green', 'red']:
-=======
         true_color = token.get('true_color', token.get('color'))
         if true_color not in ['green', 'yellow', 'red']:
             true_color = detect_token_color_robust(front_frame, token['x'], token['y'], token['radius'])
         
         if true_color not in ['green', 'yellow', 'red']:
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
             continue
 
         token_id = f"{token_lane}:{true_color}"
@@ -2092,79 +2002,6 @@ def processing_task():
         try:
             now = time.time()
             with data_lock:
-<<<<<<< HEAD
-                # Update trailing detection
-                if trailing_raw:
-                    shared_data['trailing_streak'] = shared_data.get('trailing_streak', 0) + 1
-                    shared_data['trailing_lane'] = trailing_lane
-                    if bbox is not None:
-                        shared_data['trailing_bbox'] = bbox
-                        shared_data['trailing_last_seen_time'] = time.time()
-                else:
-                    shared_data['trailing_streak'] = 0
-
-                # Keep the latest raw police box so the display can draw it after confirmation.
-                if police_raw and police_bbox is not None:
-                    shared_data['police_bbox'] = police_bbox
-                    shared_data['police_last_seen_time'] = time.time()
-
-                # Update police detection
-                history = shared_data.get('police_detection_history', [])
-                history.append(1 if police_raw else 0)
-                if len(history) > POLICE_CONFIRM_FRAMES:
-                    history.pop(0)
-                shared_data['police_detection_history'] = history
-                
-                police_confirmed = sum(history) >= (POLICE_CONFIRM_FRAMES * 0.6)
-                trailing = shared_data['trailing_streak'] >= TRAILING_CONFIRM_FRAMES
-                
-                if police_confirmed and police_lane is not None:
-                    shared_data['police_lane'] = police_lane
-                
-                shared_data['trailing_detected'] = trailing
-                shared_data['police_detected'] = police_confirmed
-                shared_data['danger_detected'] = trailing or police_confirmed
-                shared_data['police_confidence'] = confidence
-                
-                if police_confirmed:
-                    shared_data['run_summary']['police_appeared'] = True
-                    if not shared_data.get('police_active', False):
-                        shared_data['police_active'] = True
-                        shared_data['police_start_time'] = time.time()
-                        shared_data['red_token_collected_during_police'] = False
-                        print(f"[POLICE] Police car confirmed in lane {police_lane}! Confidence: {confidence:.2f}")
-                        print(f"[POLICE] Must collect red token within 10 seconds!")
-                        if not shared_data.get('police_triggered', False):
-                            shared_data['police_triggered'] = True
-                
-                if trailing:
-                    shared_data['run_summary']['trailing_appeared'] = True
-                    elapsed = time.time() - run_start_time if run_start_time else 0
-                    if not shared_data.get('trailing_first_triggered', False):
-                        shared_data['trailing_first_triggered'] = True
-                        shared_data['trailing_first_time'] = elapsed
-                        shared_data['trailing_count'] = 1
-                        print(f"[TRAILING] First trailing car at {elapsed:.2f}s in lane {trailing_lane} (10 sec to avoid)")
-                    elif not shared_data.get('trailing_second_triggered', False):
-                        shared_data['trailing_second_triggered'] = True
-                        shared_data['trailing_second_time'] = elapsed
-                        shared_data['trailing_count'] = 2
-                        print(f"[TRAILING] Second trailing car at {elapsed:.2f}s in lane {trailing_lane} (only 3 sec to avoid)")
-            
-            # Draw back camera frame
-            dbg = cv2.resize(back_frame.copy(), (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-
-            with data_lock:
-                display_trailing_bbox = bbox if bbox is not None else shared_data.get('trailing_bbox')
-                display_police_bbox = police_bbox if police_bbox is not None else shared_data.get('police_bbox')
-                display_trailing_lane = trailing_lane if trailing_lane is not None else shared_data.get('trailing_lane')
-                display_police_lane = police_lane if police_lane is not None else shared_data.get('police_lane')
-                trailing_confirmed_display = shared_data.get('trailing_detected', False)
-                police_confirmed_display = shared_data.get('police_detected', False)
-
-            if display_trailing_bbox is not None and (trailing_raw or trailing_confirmed_display):
-                draw_vehicle_box(
-=======
                 last_back_detection_time = shared_data.get('last_back_detection_time', 0.0)
                 back_debug = dict(shared_data.get('back_detection_debug', {}))
 
@@ -2292,45 +2129,37 @@ def processing_task():
             if bbox is not None and trailing_raw:
                 x, y, w, h = bbox
                 cv2.rectangle(
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
                     dbg,
-                    display_trailing_bbox,
-                    back_frame.shape,
-                    "TRAILING CAR",
-                    lane=display_trailing_lane,
-                    color=(0, 255, 255)
-                )
-
-            if display_police_bbox is not None and (police_raw or police_confirmed_display):
-                draw_vehicle_box(
+                    (int(x * scale_x), int(y * scale_y)),
+                    (int((x + w) * scale_x), int((y + h) * scale_y)),
+                    (0, 255, 255), 3)
+                cv2.putText(dbg, f"TRAILING CAR (Lane {trailing_lane})", (int(x * scale_x), int(y * scale_y) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            if police_bbox is not None and police_raw:
+                x, y, w, h = police_bbox
+                cv2.rectangle(
                     dbg,
-                    display_police_bbox,
-                    back_frame.shape,
-                    "POLICE CAR",
-                    lane=display_police_lane,
-                    confidence=confidence,
-                    color=(0, 0, 255)
-                )
+                    (int(x * scale_x), int(y * scale_y)),
+                    (int((x + w) * scale_x), int((y + h) * scale_y)),
+                    (0, 0, 255), 3)
+                cv2.putText(dbg, f"POLICE CAR (Lane {police_lane})", (int(x * scale_x), int(y * scale_y) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             status_color = (0, 255, 0)
-            if trailing_raw or trailing_confirmed_display:
+            if trailing_raw:
                 status_color = (0, 255, 255)
-            if police_raw or police_confirmed_display:
+            if police_raw:
                 status_color = (0, 0, 255)
 
             lines = [
                 "Back Camera",
-<<<<<<< HEAD
-                f"Trailing: raw={trailing_raw} confirmed={trailing_confirmed_display} Lane: {display_trailing_lane}",
-                f"Police: raw={police_raw} confirmed={police_confirmed_display} conf: {confidence:.2f} Lane: {display_police_lane}",
-=======
                 f"Detector: {detection_source} Vehicles: {len(vehicles)}",
                 f"Trailing: {trailing_raw} ({shared_data['trailing_streak']}) Lane: {trailing_lane}",
                 f"Police: {police_raw} (conf: {confidence:.2f}) Lane: {police_lane}",
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
                 f"Area: {int(area)}"
             ]
-
+            
             for idx, line in enumerate(lines):
                 cv2.putText(dbg, line, (10, 30 + idx * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
             
@@ -2376,6 +2205,7 @@ def send_controls_task():
         low_light_active = shared_data.get('low_light_active', False)
         lights_on = shared_data.get('lights_on', True)
         red_token_collected = shared_data.get('red_token_collected_during_police', False)
+        recovery_phase = shared_data.get('recovery_phase', 0)
         police_lane = shared_data.get('police_lane', None)
         trailing_lane = shared_data.get('trailing_lane', None)
         lane_follow = dict(shared_data.get('lane_follow', {}))
@@ -2418,54 +2248,6 @@ def send_controls_task():
 
     img_w, img_h = (front_frame.shape[1], front_frame.shape[0]) if front_frame is not None else (640, 480)
     
-<<<<<<< HEAD
-    # Detect hazard tokens to avoid.
-    # Red is always a hazard except during police-active red-token seeking.
-    # Yellow is always a hazard because it triggers negative/random effects.
-    red_tokens = [
-        t for t in tokens_snapshot
-        if t.get('color') == 'red' and t['y'] >= TOKEN_DECISION_Y_MIN
-    ]
-    yellow_tokens = [
-        t for t in tokens_snapshot
-        if t.get('color') == 'yellow' and t['y'] >= img_h * YELLOW_HAZARD_Y_MIN_RATIO
-    ]
-
-    hazard_lanes = set()
-    yellow_hazard_lanes = set()
-
-    for t in red_tokens:
-        t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
-        # During police-active mode, red can be a target. Otherwise it is a blocked lane.
-        if not police_active:
-            hazard_lanes.add(t_lane)
-
-    for t in yellow_tokens:
-        t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
-        hazard_lanes.add(t_lane)
-        yellow_hazard_lanes.add(t_lane)
-
-        # If yellow is very close, also avoid the neighbouring lane to reduce side-swipe collection.
-        if t['y'] >= img_h * YELLOW_ADJACENT_BUFFER_Y_RATIO:
-            if t_lane - 1 >= -2:
-                hazard_lanes.add(t_lane - 1)
-                yellow_hazard_lanes.add(t_lane - 1)
-            if t_lane + 1 <= 2:
-                hazard_lanes.add(t_lane + 1)
-                yellow_hazard_lanes.add(t_lane + 1)
-
-    # Bonus lanes must be green only.
-    # Do not use yellow as a bonus lane during evasion, because that makes the car drift into yellow tokens.
-    green_tokens_for_bonus = [
-        t for t in tokens_snapshot
-        if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN
-    ]
-    bonus_lanes = set()
-    for t in green_tokens_for_bonus:
-        t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
-        if t_lane not in hazard_lanes:
-            bonus_lanes.add(t_lane)
-=======
     # Avoid red/yellow during normal driving. Red is only a target while Police is active.
     hazard_colors = {'yellow'} if police_red_required else {'red', 'yellow'}
     hazard_tokens = [
@@ -2518,7 +2300,6 @@ def send_controls_task():
         reason = green_rejection_reason(token, img_w, img_h, current_lane, hazard_lanes)
         if reason:
             green_reject_counts[reason] = green_reject_counts.get(reason, 0) + 1
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
 
     # =========================================================
     # EMERGENCY EVASION - Police car in same lane (front)
@@ -2697,140 +2478,6 @@ def send_controls_task():
     # =========================================================
     # TOKEN DECISION - Seek reachable GREEN tokens after hazards
     # =========================================================
-<<<<<<< HEAD
-    if not police_active and not police_detected and not trailing_detected:
-        danger_tokens_front = [
-            t for t in tokens_snapshot
-            if t.get('color') in ['red', 'yellow']
-            and token_in_front_danger_zone(t, img_w, img_h)
-        ]
-
-        if danger_tokens_front:
-            closest_danger = max(danger_tokens_front, key=lambda t: t['y'])
-
-            steering_input = -1.0 if closest_danger['x'] >= img_w / 2.0 else 1.0
-            acceleration_input = HAZARD_AVOID_MAX_ACCELERATION
-
-            with data_lock:
-                shared_data['decision_debug'] = f"FRONT DANGER OVERRIDE: {closest_danger['color']}"
-
-            send_control_packet(steering_input, acceleration_input)
-            return
-    # Only seek green tokens if no police or trailing car detected
-    # =========================================================
-# TOKEN DECISION - GREEN PRIORITY WITH HAZARD AWARENESS
-# =========================================================
-
-# Only seek green tokens if no police or trailing car detected
-    if not police_detected and not trailing_detected:
-
-        # -----------------------------
-        # STEP 1: COLLECT ONLY GREEN TARGETS
-        # -----------------------------
-        green_tokens = [
-            t for t in tokens_snapshot
-            if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN
-        ]
-
-        hazard_tokens = [
-            t for t in tokens_snapshot
-            if t.get('color') in ['red', 'yellow'] and t['y'] >= TOKEN_DECISION_Y_MIN
-        ]
-
-        # -----------------------------
-        # STEP 2: LANE SCORING SYSTEM
-        # -----------------------------
-        lane_density = {lane: 0.0 for lane in range(-2, 3)}
-        lane_closest_token = {}
-
-        for t in green_tokens:
-            t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
-
-            # Never chase a green token if its lane is blocked by red/yellow.
-            if t_lane in hazard_lanes or t_lane in yellow_hazard_lanes:
-                continue
-
-            proximity = t['y'] / img_h
-
-            # Reward green tokens, especially closer ones.
-            lane_density[t_lane] += 1.0 + (proximity * 2.0)
-
-            if t_lane not in lane_closest_token or t['y'] > lane_closest_token[t_lane]['y']:
-                lane_closest_token[t_lane] = t
-
-        # -----------------------------
-        # STEP 3: APPLY STRONG HAZARD PENALTY
-        # -----------------------------
-        for h in hazard_tokens:
-            h_lane = lane_from_x(h['x'], h['y'], frame_width=img_w, frame_height=img_h)
-            proximity = h['y'] / img_h
-
-            if h_lane in lane_density:
-                if h.get('color') == 'red':
-                    lane_density[h_lane] -= 8.0 + (proximity * 6.0)
-                elif h.get('color') == 'yellow':
-                    # Yellow must be heavily penalised to reduce yellow collection.
-                    lane_density[h_lane] -= YELLOW_LANE_BLOCK_SCORE + (proximity * 20.0)
-
-                    # If yellow is close, treat neighbouring lanes as risky too.
-                    if proximity >= YELLOW_CLOSE_Y_RATIO:
-                        if h_lane - 1 in lane_density:
-                            lane_density[h_lane - 1] -= 10.0
-                        if h_lane + 1 in lane_density:
-                            lane_density[h_lane + 1] -= 10.0
-
-        # -----------------------------
-        # STEP 4: CHOOSE BEST SAFE LANE
-        # -----------------------------
-        valid_lanes = [
-            l for l in lane_density.keys()
-            if lane_density[l] > -5 and l not in yellow_hazard_lanes
-        ]
-
-        if valid_lanes:
-            best_lane = max(lane_density, key=lane_density.get)
-
-            if lane_density[best_lane] == 0:
-                best_target_lane = current_lane   
-            else:
-                best_target_lane = best_lane
-        else:
-            best_target_lane = get_safe_lane(current_lane, hazard_lanes, img_w, set())
-
-        target = lane_closest_token.get(best_target_lane, None)
-
-        # -----------------------------
-        # STEP 5: STEERING DECISION
-        # -----------------------------
-        if target is not None and best_target_lane not in hazard_lanes:
-            token_error = (target['x'] - (img_w / 2.0)) / (img_w / 2.0)
-
-            if abs(token_error) > TOKEN_CENTER_X_DEADZONE:
-                steering_input = max(-1.0, min(1.0, token_error * GREEN_STEER_GAIN))
-
-                if abs(steering_input) < GREEN_APPROACH_MIN_STEER:
-                    steering_input = GREEN_APPROACH_MIN_STEER if steering_input > 0 else -GREEN_APPROACH_MIN_STEER
-            else:
-                if best_target_lane > current_lane:
-                    steering_input = 1.0
-                elif best_target_lane < current_lane:
-                    steering_input = -1.0
-                else:
-                    steering_input = 0.0
-
-            acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
-
-        else:
-            # No safe green target. Move away from yellow/red instead of chasing tokens.
-            safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, set())
-
-            if safe_lane != current_lane:
-                steering_input = 1.0 if safe_lane > current_lane else -1.0
-                acceleration_input = min(acceleration_input, 0.58)
-            else:
-                steering_input = 0.0
-                acceleration_input = min(CAR_ACCELERATION, 0.66)
-=======
     if decision_reason != "MAINTAIN" or trailing_detected:
         green_reject_counts['event_override'] = len(green_tokens_visible)
     if decision_reason == "MAINTAIN" and not trailing_detected:
@@ -2918,7 +2565,6 @@ def send_controls_task():
                     decision_reason = "GREEN_BLOCKED_AVOID"
                     selected_target_type = "HAZARD"
                     acceleration_input = min(acceleration_input, 0.78)
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
 
     if decision_reason not in ("GREEN_TARGET", "PRE_TARGET_GREEN") and locked_green_target_frames > 0:
         locked_green_target_frames = 0
@@ -2956,9 +2602,6 @@ def send_controls_task():
         current_mode_text = mode_map.get(decision_reason, "LANE FOLLOW")
 
     with data_lock:
-<<<<<<< HEAD
-        shared_data['decision_debug'] = f"Police: {police_detected} Lane:{police_lane} | Trailing: {trailing_detected} Lane:{trailing_lane} | YellowHaz:{sorted(list(yellow_hazard_lanes))} | Steer: {steering_input:.2f} | Accel: {acceleration_input:.2f}"
-=======
         shared_data['target_lane'] = desired_lane
         shared_data['current_mode'] = current_mode_text
         shared_data['decision_debug'] = f"{decision_reason} {target_debug} L{current_lane}->{desired_lane} T{steering_state} S{steering_input:.2f} A{acceleration_input:.2f}"
@@ -2985,7 +2628,6 @@ def send_controls_task():
             }
         else:
             shared_data['green_target_debug'] = None
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
 
     try:
         send_control_packet(steering_input, acceleration_input)
@@ -3043,12 +2685,6 @@ if __name__ == '__main__':
         shared_data['police_detection_history'] = []
         shared_data['police_lane'] = None
         shared_data['trailing_lane'] = None
-<<<<<<< HEAD
-        shared_data['police_bbox'] = None
-        shared_data['trailing_bbox'] = None
-        shared_data['police_last_seen_time'] = 0.0
-        shared_data['trailing_last_seen_time'] = 0.0
-=======
         shared_data['lane_follow'] = {
             'lane_center_x': None,
             'left_line': None,
@@ -3076,7 +2712,6 @@ if __name__ == '__main__':
         shared_data['speed_modifier'] = 1.0
         shared_data['selected_target_type'] = 'NONE'
         shared_data['current_mode'] = 'LANE FOLLOW'
->>>>>>> 17af060b8a416cdfc3d1217c5a395dad26e52bbf
         shared_data['run_summary']['light_recovery_attempts'] = 0
         shared_data['run_summary']['light_recovered'] = False
         shared_data['run_summary']['speed_penalties'] = 0
