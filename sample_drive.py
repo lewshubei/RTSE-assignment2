@@ -145,7 +145,7 @@ def setup_control_server():
 # Task Implementations (This is where you write your tasks)
 # ---------------------------------------------------------
 
-def read_single_camera(sock, window_name, data_key):
+def read_single_camera(sock, window_name, data_key, display=True):
     #This function reads the latest frame from the camera socket and stores it in the shared data
     if sock is None:
         return
@@ -195,10 +195,11 @@ def read_single_camera(sock, window_name, data_key):
                 with data_lock:
                     shared_data[data_key] = frame
                 
-                # You may disable this if you don't need to display the frames / This could effect the fps
-                frame_resized = cv2.resize(frame, (640, 480))
-                cv2.imshow(window_name, frame_resized)
-                cv2.waitKey(1)
+                if display:
+                    # You may disable this if you don't need to display the frames / This could effect the fps
+                    frame_resized = cv2.resize(frame, (640, 480))
+                    cv2.imshow(window_name, frame_resized)
+                    cv2.waitKey(1)
                 
     except Exception as e:
         pass
@@ -207,7 +208,7 @@ def read_front_camera_task():
     read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
 
 def read_back_camera_task():
-    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
+    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame', display=False)
 
 def detect_colored_tokens(frame):
     """
@@ -328,10 +329,10 @@ def detect_trailing_and_police(back_frame):
     - trailing_detected: True when a large moving object is detected behind the player and appears to be approaching
     - police_detected: True when red+blue flashing lights are detected in the back camera (simple color heuristic)
 
-    Returns: (trailing_detected(bool), police_detected(bool), largest_area(float))
+    Returns: (trailing_detected(bool), police_detected(bool), largest_area(float), largest_bbox(tuple|None))
     """
     if back_frame is None:
-        return False, False, 0.0
+        return False, False, 0.0, None
 
     gray = cv2.cvtColor(back_frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 0)
@@ -342,6 +343,7 @@ def detect_trailing_and_police(back_frame):
     largest_area = 0.0
     trailing = False
     police = False
+    largest_bbox = None
 
     # Motion-based trailing detection via frame differencing
     if prev_gray is not None:
@@ -356,6 +358,7 @@ def detect_trailing_and_police(back_frame):
             area = cv2.contourArea(cnt)
             if area > largest_area:
                 largest_area = area
+                largest_bbox = cv2.boundingRect(cnt)
 
         # If a sufficiently large moving blob exists, consider it a trailing object
         if largest_area > 2000:
@@ -395,7 +398,7 @@ def detect_trailing_and_police(back_frame):
         shared_data['back_prev_gray'] = gray
         shared_data['back_prev_area'] = largest_area
 
-    return trailing, police, largest_area
+    return trailing, police, largest_area, largest_bbox
 
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
@@ -421,19 +424,36 @@ def processing_task():
 
     # Run trailing / police detection on back camera
     if back_frame is not None:
-        trailing, police, area = detect_trailing_and_police(back_frame)
+        trailing, police, area, bbox = detect_trailing_and_police(back_frame)
         with data_lock:
             shared_data['trailing_detected'] = trailing
             shared_data['police_detected'] = police
             shared_data['danger_detected'] = trailing or False
 
-        # show small overlay on back camera for debug
+        # Show the rear view in the same window, with detection overlays on top.
         try:
             dbg = back_frame.copy()
-            txt = f"Trailing:{trailing} Police:{police} Area:{int(area)}"
-            cv2.putText(dbg, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            if bbox is not None and trailing:
+                x, y, w, h = bbox
+                cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 255, 255), 2)
+
+            status_color = (0, 255, 0)
+            if trailing:
+                status_color = (0, 255, 255)
+            if police:
+                status_color = (0, 0, 255)
+
+            lines = [
+                "Back Camera",
+                f"Trailing: {trailing}",
+                f"Police: {police}",
+                f"Area: {int(area)}"
+            ]
+            for idx, line in enumerate(lines):
+                cv2.putText(dbg, line, (10, 30 + idx * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
             dbg = cv2.resize(dbg, (640, 480))
-            cv2.imshow("Back Detection", dbg)
+            cv2.imshow("Back Camera", dbg)
             cv2.waitKey(1)
         except Exception:
             pass
