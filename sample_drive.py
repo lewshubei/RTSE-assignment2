@@ -295,26 +295,28 @@ def send_controls_task():
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
 if __name__ == '__main__':
+    # 1. Define the tester function properly
     def mock_team_a_tester():
-    
         print("[TESTER] Mock Team A thread started.")
-        time.sleep(5) # Wait for the simulator to launch fully
-    
-    while is_running:
-        print("\n--- [TEST] Simulating: Green Token on Right Lane! ---")
-        with data_lock:
-            shared_data['target_lane'] = 1  # Tell your code to move Right
-        time.sleep(4)
+        time.sleep(5) # Wait for the simulator to fully launch and connect
         
-        print("\n--- [TEST] Simulating: Green Token on Left Lane! ---")
-        with data_lock:
-            shared_data['target_lane'] = -1 # Tell your code to move Left
-        time.sleep(4)
-        
-        print("\n--- [TEST] Simulating: Moving back to Center Lane! ---")
-        with data_lock:
-            shared_data['target_lane'] = 0  # Tell your code to move to Center
-        time.sleep(4)
+        while is_running:
+            print("\n--- [TEST] Simulating: Green Token on Right Lane! ---")
+            with data_lock:
+                shared_data['target_lane'] = 1  # Tell your control thread to move Right
+            time.sleep(4)
+            
+            print("\n--- [TEST] Simulating: Green Token on Left Lane! ---")
+            with data_lock:
+                shared_data['target_lane'] = -1 # Tell your control thread to move Left
+            time.sleep(4)
+            
+            print("\n--- [TEST] Simulating: Moving back to Center Lane! ---")
+            with data_lock:
+                shared_data['target_lane'] = 0  # Tell your control thread to move to Center
+            time.sleep(4)
+
+    print("Initializing RTSE Sample Drive...")
 
 # To start this tester thread, add this line inside your `__main__` section:
 # threading.Thread(target=mock_team_a_tester, daemon=True).start()
