@@ -22,7 +22,8 @@ shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
     'steering_input' : 0.0,
-    'acceleration_input' : 0.0
+    'acceleration_input' : 0.0,
+    'detected_tokens': []
 }
 data_lock = threading.Lock()
 is_running = True
@@ -198,6 +199,110 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
+def detect_colored_tokens(frame):
+    """
+    Detect green, yellow, and red circular tokens from the front camera.
+
+    Output format:
+    [
+        {"color": "green", "x": 320, "y": 240, "radius": 25, "area": 1800.0},
+        ...
+    ]
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    color_ranges = {
+        "green": [
+            ((35, 80, 80), (85, 255, 255))
+        ],
+        "yellow": [
+            ((20, 80, 80), (35, 255, 255))
+        ],
+        "red": [
+            ((0, 80, 80), (10, 255, 255)),
+            ((170, 80, 80), (180, 255, 255))
+        ]
+    }
+
+    detected_tokens = []
+    kernel = np.ones((5, 5), np.uint8)
+
+    for color_name, ranges in color_ranges.items():
+        color_mask = None
+
+        for lower, upper in ranges:
+            lower_np = np.array(lower, dtype=np.uint8)
+            upper_np = np.array(upper, dtype=np.uint8)
+            current_mask = cv2.inRange(hsv, lower_np, upper_np)
+
+            if color_mask is None:
+                color_mask = current_mask
+            else:
+                color_mask = cv2.bitwise_or(color_mask, current_mask)
+
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            color_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 100:
+                continue
+
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if circularity < 0.6:
+                continue
+
+            (x, y), radius = cv2.minEnclosingCircle(contour)
+            if radius < 5:
+                continue
+
+            detected_tokens.append({
+                "color": color_name,
+                "x": int(x),
+                "y": int(y),
+                "radius": int(radius),
+                "area": float(area)
+            })
+
+    return detected_tokens
+
+def draw_detected_tokens(frame, tokens):
+    display_frame = frame.copy()
+
+    text_colors = {
+        "green": (0, 255, 0),
+        "yellow": (0, 255, 255),
+        "red": (0, 0, 255)
+    }
+
+    for token in tokens:
+        color = text_colors.get(token["color"], (255, 255, 255))
+        center = (token["x"], token["y"])
+        radius = token["radius"]
+
+        cv2.circle(display_frame, center, radius, color, 2)
+        cv2.putText(
+            display_frame,
+            token["color"],
+            (token["x"] - 20, token["y"] - radius - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2
+        )
+
+    return display_frame
+
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
     #You can use libraries like OpenCV to process the image
@@ -207,8 +312,15 @@ def processing_task():
         front_frame = shared_data['latest_front_frame']
     
     if front_frame is not None:
-        # write your processing here
-        pass
+        tokens = detect_colored_tokens(front_frame)
+
+        with data_lock:
+            shared_data['detected_tokens'] = tokens
+
+        debug_frame = draw_detected_tokens(front_frame, tokens)
+        debug_frame = cv2.resize(debug_frame, (640, 480))
+        cv2.imshow("Detected Tokens", debug_frame)
+        cv2.waitKey(1)
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
