@@ -22,7 +22,9 @@ shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
     'steering_input' : 0.0,
-    'acceleration_input' : 0.0
+    'acceleration_input' : 0.0,
+    'target_lane': 0,          # Default: Stay in Center Lane (0)
+    'danger_detected': False   # Default: No trailing car danger
 }
 data_lock = threading.Lock()
 is_running = True
@@ -210,32 +212,112 @@ def processing_task():
         # write your processing here
         pass
 
+# def send_controls_task():
+#     #This is where you send the control commands to the car using the control_conn
+#     global control_conn
+#     if control_conn is None:
+#         return
+    
+#     #these are the variables used to control the car
+#     #steering_input: -1.0 to 1.0 (left to right)
+#     #acceleration_input: -1.0 to 1.0 (reverse to forward)
+#     #this example always accelerate forward
+#     steering_input = 0.0
+#     acceleration_input = 1.0
+
+#     try:
+#         # Pack and send the control command
+#         data = struct.pack('ff', steering_input, acceleration_input)
+#         control_conn.sendall(data)
+#     except Exception as e:
+#         print(f"Control send error: {e}")
+#         control_conn = None
+# Global variables to track our steering state machine
+steering_state = 0       # 0 = Idle, 1 = Tapping, 2 = Resetting
+tap_loop_count = 0       # Counts how many loops we hold the steering wheel
+current_lane = 0         # Tracks our car's actual lane position (-1, 0, 1)
 def send_controls_task():
-    #This is where you send the control commands to the car using the control_conn
-    global control_conn
+    global control_conn, steering_state, tap_loop_count, current_lane
+    
     if control_conn is None:
         return
     
-    #these are the variables used to control the car
-    #steering_input: -1.0 to 1.0 (left to right)
-    #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
+    # 1. Read the decisions made from shared memory safely
+    with data_lock:
+        target_lane = shared_data['target_lane']
+        danger_detected = shared_data['danger_detected']
+    
+    # Default values
     steering_input = 0.0
-    acceleration_input = 1.0
+    acceleration_input = 1.0  # Cruise at full speed forward by default
+    
+    # 2. STATE MACHINE LOGIC
+    if steering_state == 0:
+        # STATE 0: IDLE (Wait for a lane change request)
+        if target_lane != current_lane:
+            steering_state = 1  # Trigger a tap maneuver!
+            tap_loop_count = 0  # Reset our timer counter
+            print(f"[CONTROL] Lane change requested from {current_lane} to {target_lane}")
+            
+    elif steering_state == 1:
+        # STATE 1: TAPPING (Actively turning the wheel)
+        if target_lane > current_lane:
+            steering_input = 1.0   # Tap Right
+        else:
+            steering_input = -1.0  # Tap Left
+            
+        tap_loop_count += 1
+        
+        
+        if tap_loop_count >= 10:
+            steering_state = 2  # Turn finished, proceed to reset step
+            tap_loop_count = 0  # Reset counter
+            current_lane = target_lane # Update our position tracker
+            
+    elif steering_state == 2:
+        # STATE 2: RESETTING (Force wheel back to center before doing anything else)
+        steering_input = 0.0
+        tap_loop_count += 1
+        
+        # Hold the wheel steady for 5 loops to stabilize the car body
+        if tap_loop_count >= 5:
+            steering_state = 0  # Done! Return to idle mode
+            print("[CONTROL] Lane change maneuver completed successfully.")
 
+    # 3. Pack and send the automated floating-point values to the simulator
     try:
-        # Pack and send the control command
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
         control_conn = None
-
-
 # ---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
 if __name__ == '__main__':
+    def mock_team_a_tester():
+    
+        print("[TESTER] Mock Team A thread started.")
+        time.sleep(5) # Wait for the simulator to launch fully
+    
+    while is_running:
+        print("\n--- [TEST] Simulating: Green Token on Right Lane! ---")
+        with data_lock:
+            shared_data['target_lane'] = 1  # Tell your code to move Right
+        time.sleep(4)
+        
+        print("\n--- [TEST] Simulating: Green Token on Left Lane! ---")
+        with data_lock:
+            shared_data['target_lane'] = -1 # Tell your code to move Left
+        time.sleep(4)
+        
+        print("\n--- [TEST] Simulating: Moving back to Center Lane! ---")
+        with data_lock:
+            shared_data['target_lane'] = 0  # Tell your code to move to Center
+        time.sleep(4)
+
+# To start this tester thread, add this line inside your `__main__` section:
+# threading.Thread(target=mock_team_a_tester, daemon=True).start()
     print("Initializing RTSE Sample Drive...")
     
     # Initialize network connections
