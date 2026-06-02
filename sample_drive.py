@@ -477,4 +477,5 @@ if __name__ == '__main__':
     if control_conn:
         control_conn.close()
     cv2.destroyAllWindows()
+    
     print("System terminated cleanly.")
