@@ -289,17 +289,26 @@ def detect_colored_tokens(frame):
             circularity = 4 * np.pi * area / (perimeter * perimeter)
             # A perfect circle has a circularity of 1.0. A square is ~0.78.
             # Curbs are long and irregular, so they will have a much lower circularity.
-            if circularity < 0.4:
+            if circularity < 0.6:
                 continue
 
             # Ensure the bounding box is somewhat square (since tokens are round)
             bx, by, bw, bh = cv2.boundingRect(contour)
             aspect_ratio = float(bw) / bh if bh > 0 else 0.0
-            if aspect_ratio < 0.4 or aspect_ratio > 2.5:
+            if aspect_ratio < 0.6 or aspect_ratio > 1.6:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
             if radius < 5:
+                continue
+
+            frame_h, frame_w = frame.shape[:2]
+            vp_x = frame_w / 2.0
+            vp_y = frame_h * 0.45
+            if y <= vp_y + 5:
+                continue
+            slope = (x - vp_x) / (y - vp_y)
+            if slope < -0.85 or slope > 0.85:
                 continue
 
             detected_tokens.append({
@@ -659,8 +668,9 @@ def send_controls_task():
         green_lanes = set()
         
         for t in tokens_snapshot:
-            # Only consider tokens that are somewhat close (e.g. y > 150) so we don't react too early
-            if t['y'] > 150:
+            # Only consider tokens that are somewhat close (e.g. y > 230) so we don't react too early
+            # and to avoid tokens above the horizon line (y <= 216) which map incorrectly.
+            if t['y'] > 230:
                 lane = lane_from_x(t['x'], t['y'], frame_width=640)
                 if t['color'] in ['red', 'yellow']:
                     safe_lanes.discard(lane)
