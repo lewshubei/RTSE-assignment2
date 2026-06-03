@@ -324,12 +324,37 @@ def draw_detected_tokens(frame, tokens):
     return display_frame
 
 
-def lane_from_x(x, frame_width=640):
-    # Map x coordinate (0..frame_width) to lane index (-2..2)
-    lane_count = 5
-    lane_width = frame_width / lane_count
-    lane = int(x // lane_width) - 2
-    return max(-2, min(2, lane))
+def lane_from_x(x, y=None, frame_width=640, frame_height=480):
+    # If y is not provided, fallback to the old simple split method
+    if y is None:
+        lane_count = 5
+        lane_width = frame_width / lane_count
+        lane = int(x // lane_width) - 2
+        return max(-2, min(2, lane))
+        
+    # Perspective-based lane calculation
+    # The road lines radiate from a vanishing point near the horizon
+    vp_x = frame_width / 2.0
+    vp_y = frame_height * 0.45  # Approximate horizon line
+    
+    if y <= vp_y:
+        return 0 # Too high up, default to center
+        
+    dy = y - vp_y
+    dx = x - vp_x
+    slope = dx / dy
+    
+    # Slopes defining the lane boundaries
+    if slope < -0.6:
+        return -2
+    elif slope < -0.2:
+        return -1
+    elif slope < 0.2:
+        return 0
+    elif slope < 0.6:
+        return 1
+    else:
+        return 2
 
 
 def detect_trailing_and_police(back_frame):
@@ -376,14 +401,21 @@ def detect_trailing_and_police(back_frame):
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area > largest_area:
-                largest_area = area
-                x, y, w, h = cv2.boundingRect(cnt)
-                # Offset bounding box back to original frame coordinates
-                largest_bbox = (x + t_roi_x1, y + t_roi_y1, w, h)
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Tokens lying on the ground appear as very wide, flat objects when they pass under the car.
+            # A trailing car is a 3D object and will have a much taller bounding box.
+            aspect_ratio = float(w) / h if h > 0 else 0.0
+            
+            # Filter out flat objects (tokens) and require a minimum physical height in the ROI
+            if aspect_ratio < 2.5 and h > (t_roi_y2 - t_roi_y1) * 0.15:
+                if area > largest_area:
+                    largest_area = area
+                    # Offset bounding box back to original frame coordinates
+                    largest_bbox = (x + t_roi_x1, y + t_roi_y1, w, h)
 
-        # Minimum threshold for an approaching car within this ROI (around 3000 pixels)
-        TRAILING_MOTION_AREA_MIN_ROI = 3000
+        # Minimum threshold for an approaching car within this ROI (around 6000 pixels to ignore small tokens)
+        TRAILING_MOTION_AREA_MIN_ROI = 6000
         TRAILING_APPROACH_RATIO = 1.05  # slightly more forgiving since ROI is smaller
 
         if largest_area > TRAILING_MOTION_AREA_MIN_ROI:
@@ -562,7 +594,7 @@ def send_controls_task():
             # pick the red token closest to center x
             frame_center_x = 320
             nearest = min(red_tokens, key=lambda t: abs(t['x'] - frame_center_x))
-            desired_lane = lane_from_x(nearest['x'], frame_width=640)
+            desired_lane = lane_from_x(nearest['x'], nearest['y'], frame_width=640)
             with data_lock:
                 shared_data['target_lane'] = desired_lane
             target_lane = desired_lane
@@ -572,7 +604,7 @@ def send_controls_task():
             acceleration_input = 0.0
             print("[EVENT] Police behind: no red token visible, braking")
 
-    if trailing_detected:
+    elif trailing_detected:
         # Try to move to an adjacent lane away from our current lane
         evasive_lane = current_lane
         if current_lane < 2:
@@ -586,6 +618,43 @@ def send_controls_task():
         with data_lock:
             shared_data['danger_detected'] = True
         print(f"[EVENT] Trailing car detected: requesting evasive lane {evasive_lane}")
+
+    else:
+        # Standard cruising logic: collect green, avoid red/yellow
+        safe_lanes = set([-2, -1, 0, 1, 2])
+        green_lanes = set()
+        
+        for t in tokens_snapshot:
+            # Only consider tokens that are somewhat close (e.g. y > 150) so we don't react too early
+            if t['y'] > 150:
+                lane = lane_from_x(t['x'], t['y'], frame_width=640)
+                if t['color'] in ['red', 'yellow']:
+                    safe_lanes.discard(lane)
+                elif t['color'] == 'green':
+                    green_lanes.add(lane)
+                
+        desired_lane = target_lane
+        
+        # If current target is unsafe, or we are in an unsafe lane, we must find a new safe lane
+        if current_lane not in safe_lanes or target_lane not in safe_lanes:
+            if safe_lanes:
+                # Prioritize safe lanes with green tokens
+                safe_green = green_lanes.intersection(safe_lanes)
+                if safe_green:
+                    desired_lane = min(safe_green, key=lambda l: abs(l - current_lane))
+                else:
+                    desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
+        else:
+            # We are safe. Can we grab a green token?
+            safe_green = green_lanes.intersection(safe_lanes)
+            if safe_green and target_lane not in safe_green:
+                desired_lane = min(safe_green, key=lambda l: abs(l - current_lane))
+
+        if desired_lane != target_lane:
+            with data_lock:
+                shared_data['target_lane'] = desired_lane
+            target_lane = desired_lane
+            print(f"[CRUISE] Target lane updated to {desired_lane} based on tokens.")
 
     if steering_state == 0:
         # STATE 0: IDLE (Wait for a lane change request)
