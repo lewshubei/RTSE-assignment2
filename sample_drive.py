@@ -38,6 +38,15 @@ shared_data.update({
 data_lock = threading.Lock()
 is_running = True
 
+# Back-camera detection tuning
+TRAILING_MOTION_AREA_MIN = 3500
+TRAILING_APPROACH_RATIO = 1.15
+POLICE_MIN_COLOR_AREA = 300
+POLICE_ROI_X_START = 0.20
+POLICE_ROI_X_END = 0.80
+POLICE_ROI_Y_START = 0.35
+POLICE_ROI_Y_END = 0.95
+
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
 # ---------------------------------------------------------
@@ -325,30 +334,41 @@ def lane_from_x(x, frame_width=640):
 
 def detect_trailing_and_police(back_frame):
     """
-    Heuristic vision-based detection using the back camera frame.
-    - trailing_detected: True when a large moving object is detected behind the player and appears to be approaching
-    - police_detected: True when red+blue flashing lights are detected in the back camera (simple color heuristic)
+    Robust vision-based detection using the back camera frame.
+    - trailing_detected: True when a large moving object is detected directly behind the player in a constrained ROI.
+    - police_detected: True when bright neon red+blue lights are detected horizontally aligned in the back camera.
 
     Returns: (trailing_detected(bool), police_detected(bool), largest_area(float), largest_bbox(tuple|None))
     """
     if back_frame is None:
         return False, False, 0.0, None
 
-    gray = cv2.cvtColor(back_frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+    frame_h, frame_w = back_frame.shape[:2]
+
+    # --- 1. Trailing Car Detection (Constrained ROI) ---
+    # We only look at the center lane directly behind us to ignore the fast-moving scenery on the sides.
+    # X: 35% to 65% of width, Y: 40% to 90% of height.
+    t_roi_x1 = int(frame_w * 0.35)
+    t_roi_x2 = int(frame_w * 0.65)
+    t_roi_y1 = int(frame_h * 0.40)
+    t_roi_y2 = int(frame_h * 0.90)
+
+    t_roi = back_frame[t_roi_y1:t_roi_y2, t_roi_x1:t_roi_x2]
+    gray_roi = cv2.cvtColor(t_roi, cv2.COLOR_BGR2GRAY)
+    gray_roi = cv2.GaussianBlur(gray_roi, (7, 7), 0)
 
     with data_lock:
-        prev_gray = shared_data.get('back_prev_gray')
+        prev_gray_roi = shared_data.get('back_prev_gray')
+        prev_area = shared_data.get('back_prev_area', 0.0)
 
     largest_area = 0.0
-    trailing = False
-    police = False
     largest_bbox = None
+    trailing = False
 
-    # Motion-based trailing detection via frame differencing
-    if prev_gray is not None:
-        diff = cv2.absdiff(prev_gray, gray)
-        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+    if prev_gray_roi is not None and prev_gray_roi.shape == gray_roi.shape:
+        # Frame differencing purely inside the safe ROI
+        diff = cv2.absdiff(prev_gray_roi, gray_roi)
+        _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
         kernel = np.ones((5, 5), np.uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
@@ -358,44 +378,77 @@ def detect_trailing_and_police(back_frame):
             area = cv2.contourArea(cnt)
             if area > largest_area:
                 largest_area = area
-                largest_bbox = cv2.boundingRect(cnt)
+                x, y, w, h = cv2.boundingRect(cnt)
+                # Offset bounding box back to original frame coordinates
+                largest_bbox = (x + t_roi_x1, y + t_roi_y1, w, h)
 
-        # If a sufficiently large moving blob exists, consider it a trailing object
-        if largest_area > 2000:
-            # compare to previous area to guess if it's approaching
-            with data_lock:
-                prev_area = shared_data.get('back_prev_area', 0.0)
+        # Minimum threshold for an approaching car within this ROI (around 3000 pixels)
+        TRAILING_MOTION_AREA_MIN_ROI = 3000
+        TRAILING_APPROACH_RATIO = 1.05  # slightly more forgiving since ROI is smaller
 
-            if prev_area <= 0 or largest_area > prev_area * 1.1:
+        if largest_area > TRAILING_MOTION_AREA_MIN_ROI:
+            if prev_area > 0 and largest_area > (prev_area * TRAILING_APPROACH_RATIO):
                 trailing = True
 
-    # Police detection heuristic: look for red and blue bright regions (flashing lights)
-    hsv = cv2.cvtColor(back_frame, cv2.COLOR_BGR2HSV)
+    # --- 2. Police Detection (Bright Neon Color Filters) ---
+    # Police cars have bright lightbars. We look at the upper-middle section.
+    p_roi_x1 = int(frame_w * 0.20)
+    p_roi_x2 = int(frame_w * 0.80)
+    p_roi_y1 = int(frame_h * 0.30)
+    p_roi_y2 = int(frame_h * 0.70)
+    
+    p_roi = back_frame[p_roi_y1:p_roi_y2, p_roi_x1:p_roi_x2]
+    hsv_roi = cv2.cvtColor(p_roi, cv2.COLOR_BGR2HSV)
 
-    # red ranges
-    lower_red1 = np.array([0, 120, 150])
+    # Use very strict Saturation (>180) and Value (>200) thresholds to ignore dull environmental colors
+    lower_red1 = np.array([0, 180, 200])
     upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 120, 150])
+    lower_red2 = np.array([170, 180, 200])
     upper_red2 = np.array([180, 255, 255])
-
-    # blue range
-    lower_blue = np.array([100, 120, 150])
+    
+    lower_blue = np.array([100, 180, 200])
     upper_blue = np.array([140, 255, 255])
 
-    red_mask = cv2.inRange(hsv, lower_red1, upper_red1)
-    red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    red_mask = cv2.bitwise_or(red_mask, red_mask2)
-    blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+    red_mask1 = cv2.inRange(hsv_roi, lower_red1, upper_red1)
+    red_mask2 = cv2.inRange(hsv_roi, lower_red2, upper_red2)
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+    blue_mask = cv2.inRange(hsv_roi, lower_blue, upper_blue)
 
-    red_area = np.sum(red_mask > 0)
-    blue_area = np.sum(blue_mask > 0)
+    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blue_contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if red_area > 500 and blue_area > 500:
-        police = True
+    police = False
+    POLICE_MIN_BRIGHT_AREA = 100
 
-    # store current gray and area for next call
+    red_centers = []
+    for cnt in red_contours:
+        if cv2.contourArea(cnt) > POLICE_MIN_BRIGHT_AREA:
+            x, y, w, h = cv2.boundingRect(cnt)
+            red_centers.append((x + w/2.0, y + h/2.0))
+
+    blue_centers = []
+    for cnt in blue_contours:
+        if cv2.contourArea(cnt) > POLICE_MIN_BRIGHT_AREA:
+            x, y, w, h = cv2.boundingRect(cnt)
+            blue_centers.append((x + w/2.0, y + h/2.0))
+
+    if red_centers and blue_centers:
+        # Check if the bright red and blue lights are horizontally aligned (lightbar on top of the car)
+        # Max horizontal distance and max vertical distance
+        max_x_dist = frame_w * 0.40
+        max_y_dist = frame_h * 0.10  # They should be relatively on the same horizontal plane
+
+        for rx, ry in red_centers:
+            for bx, by in blue_centers:
+                if abs(rx - bx) <= max_x_dist and abs(ry - by) <= max_y_dist:
+                    police = True
+                    break
+            if police:
+                break
+
+    # Save state for next frame
     with data_lock:
-        shared_data['back_prev_gray'] = gray
+        shared_data['back_prev_gray'] = gray_roi
         shared_data['back_prev_area'] = largest_area
 
     return trailing, police, largest_area, largest_bbox
