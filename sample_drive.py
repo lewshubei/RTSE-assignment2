@@ -279,7 +279,15 @@ def detect_colored_tokens(frame):
                 continue
 
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity < 0.6:
+            # A perfect circle has a circularity of 1.0. A square is ~0.78.
+            # Curbs are long and irregular, so they will have a much lower circularity.
+            if circularity < 0.75:
+                continue
+
+            # Ensure the bounding box is somewhat square (since tokens are round)
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            aspect_ratio = float(bw) / bh if bh > 0 else 0.0
+            if aspect_ratio < 0.6 or aspect_ratio > 1.4:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
