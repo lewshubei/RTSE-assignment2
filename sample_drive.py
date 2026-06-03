@@ -33,7 +33,15 @@ shared_data.update({
     'police_detected': False,
     'trailing_detected': False,
     'back_prev_gray': None,
-    'back_prev_area': 0.0
+    'back_prev_area': 0.0,
+    'run_summary': {
+        'green_collected': 0,
+        'red_collected': 0,
+        'yellow_collected': 0,
+        'police_appeared': False,
+        'trailing_appeared': False
+    },
+    'last_collected_time': 0.0
 })
 data_lock = threading.Lock()
 is_running = True
@@ -214,7 +222,7 @@ def read_single_camera(sock, window_name, data_key, display=True):
         pass
 
 def read_front_camera_task():
-    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
+    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame', display=False)
 
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame', display=False)
@@ -281,13 +289,13 @@ def detect_colored_tokens(frame):
             circularity = 4 * np.pi * area / (perimeter * perimeter)
             # A perfect circle has a circularity of 1.0. A square is ~0.78.
             # Curbs are long and irregular, so they will have a much lower circularity.
-            if circularity < 0.75:
+            if circularity < 0.4:
                 continue
 
             # Ensure the bounding box is somewhat square (since tokens are round)
             bx, by, bw, bh = cv2.boundingRect(contour)
             aspect_ratio = float(bw) / bh if bh > 0 else 0.0
-            if aspect_ratio < 0.6 or aspect_ratio > 1.4:
+            if aspect_ratio < 0.4 or aspect_ratio > 2.5:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
@@ -512,7 +520,7 @@ def processing_task():
 
         debug_frame = draw_detected_tokens(front_frame, tokens)
         debug_frame = cv2.resize(debug_frame, (640, 480))
-        cv2.imshow("Detected Tokens", debug_frame)
+        cv2.imshow("Front Camera", debug_frame)
         cv2.waitKey(1)
 
     # Run trailing / police detection on back camera
@@ -522,6 +530,11 @@ def processing_task():
             shared_data['trailing_detected'] = trailing
             shared_data['police_detected'] = police
             shared_data['danger_detected'] = trailing or False
+            
+            if police:
+                shared_data['run_summary']['police_appeared'] = True
+            if trailing:
+                shared_data['run_summary']['trailing_appeared'] = True
 
         # Show the rear view in the same window, with detection overlays on top.
         try:
@@ -584,10 +597,23 @@ def send_controls_task():
     # 1. Read the decisions made from shared memory safely
     with data_lock:
         target_lane = shared_data['target_lane']
-        danger_detected = shared_data['danger_detected']
+        
         police_detected = shared_data.get('police_detected', False)
         trailing_detected = shared_data.get('trailing_detected', False)
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
+        last_collected_time = shared_data.get('last_collected_time', 0.0)
+    
+    # 1.5. Check for collected tokens (estimate based on position and lane)
+    current_time = time.time()
+    if current_time - last_collected_time > 0.4:
+        for t in tokens_snapshot:
+            if t['y'] > 350:
+                t_lane = lane_from_x(t['x'], t['y'], frame_width=640)
+                if t_lane == current_lane:
+                    with data_lock:
+                        shared_data['run_summary'][f"{t['color']}_collected"] += 1
+                        shared_data['last_collected_time'] = current_time
+                    break
     
     # Default values
     steering_input = 0.0
@@ -778,3 +804,20 @@ if __name__ == '__main__':
         control_conn.close()
     cv2.destroyAllWindows()
     print("System terminated cleanly.")
+    
+    # Print run summary
+    print("\n" + "="*45)
+    print(" 🚗  END OF RUN SUMMARY  🚗")
+    print("="*45)
+    with data_lock:
+        summary = shared_data.get('run_summary', {})
+    if summary:
+        print("Tokens Collected (Estimated):")
+        print(f"  🟢 Green:  {summary.get('green_collected', 0)}")
+        print(f"  🟡 Yellow: {summary.get('yellow_collected', 0)}")
+        print(f"  🔴 Red:    {summary.get('red_collected', 0)}")
+        print("-" * 45)
+        print("Events Detected During Run:")
+        print(f"  🚓 Police Car Appeared:   {'YES' if summary.get('police_appeared') else 'NO'}")
+        print(f"  🚘 Trailing Car Appeared: {'YES' if summary.get('trailing_appeared') else 'NO'}")
+    print("="*45 + "\n")
