@@ -27,6 +27,14 @@ shared_data = {
     'target_lane': 0,          # Default: Stay in Center Lane (0)
     'danger_detected': False   # Default: No trailing car danger
 }
+
+# Additional shared flags / history for trailing/police detection
+shared_data.update({
+    'police_detected': False,
+    'trailing_detected': False,
+    'back_prev_gray': None,
+    'back_prev_area': 0.0
+})
 data_lock = threading.Lock()
 is_running = True
 
@@ -305,6 +313,90 @@ def draw_detected_tokens(frame, tokens):
 
     return display_frame
 
+
+def lane_from_x(x, frame_width=640):
+    # Map x coordinate (0..frame_width) to lane index (-2..2)
+    lane_count = 5
+    lane_width = frame_width / lane_count
+    lane = int(x // lane_width) - 2
+    return max(-2, min(2, lane))
+
+
+def detect_trailing_and_police(back_frame):
+    """
+    Heuristic vision-based detection using the back camera frame.
+    - trailing_detected: True when a large moving object is detected behind the player and appears to be approaching
+    - police_detected: True when red+blue flashing lights are detected in the back camera (simple color heuristic)
+
+    Returns: (trailing_detected(bool), police_detected(bool), largest_area(float))
+    """
+    if back_frame is None:
+        return False, False, 0.0
+
+    gray = cv2.cvtColor(back_frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    with data_lock:
+        prev_gray = shared_data.get('back_prev_gray')
+
+    largest_area = 0.0
+    trailing = False
+    police = False
+
+    # Motion-based trailing detection via frame differencing
+    if prev_gray is not None:
+        diff = cv2.absdiff(prev_gray, gray)
+        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((5, 5), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > largest_area:
+                largest_area = area
+
+        # If a sufficiently large moving blob exists, consider it a trailing object
+        if largest_area > 2000:
+            # compare to previous area to guess if it's approaching
+            with data_lock:
+                prev_area = shared_data.get('back_prev_area', 0.0)
+
+            if prev_area <= 0 or largest_area > prev_area * 1.1:
+                trailing = True
+
+    # Police detection heuristic: look for red and blue bright regions (flashing lights)
+    hsv = cv2.cvtColor(back_frame, cv2.COLOR_BGR2HSV)
+
+    # red ranges
+    lower_red1 = np.array([0, 120, 150])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 120, 150])
+    upper_red2 = np.array([180, 255, 255])
+
+    # blue range
+    lower_blue = np.array([100, 120, 150])
+    upper_blue = np.array([140, 255, 255])
+
+    red_mask = cv2.inRange(hsv, lower_red1, upper_red1)
+    red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = cv2.bitwise_or(red_mask, red_mask2)
+    blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+    red_area = np.sum(red_mask > 0)
+    blue_area = np.sum(blue_mask > 0)
+
+    if red_area > 500 and blue_area > 500:
+        police = True
+
+    # store current gray and area for next call
+    with data_lock:
+        shared_data['back_prev_gray'] = gray
+        shared_data['back_prev_area'] = largest_area
+
+    return trailing, police, largest_area
+
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
     #You can use libraries like OpenCV to process the image
@@ -313,6 +405,9 @@ def processing_task():
     with data_lock:
         front_frame = shared_data['latest_front_frame']
     
+    with data_lock:
+        back_frame = shared_data.get('latest_back_frame')
+
     if front_frame is not None:
         tokens = detect_colored_tokens(front_frame)
 
@@ -323,6 +418,25 @@ def processing_task():
         debug_frame = cv2.resize(debug_frame, (640, 480))
         cv2.imshow("Detected Tokens", debug_frame)
         cv2.waitKey(1)
+
+    # Run trailing / police detection on back camera
+    if back_frame is not None:
+        trailing, police, area = detect_trailing_and_police(back_frame)
+        with data_lock:
+            shared_data['trailing_detected'] = trailing
+            shared_data['police_detected'] = police
+            shared_data['danger_detected'] = trailing or False
+
+        # show small overlay on back camera for debug
+        try:
+            dbg = back_frame.copy()
+            txt = f"Trailing:{trailing} Police:{police} Area:{int(area)}"
+            cv2.putText(dbg, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            dbg = cv2.resize(dbg, (640, 480))
+            cv2.imshow("Back Detection", dbg)
+            cv2.waitKey(1)
+        except Exception:
+            pass
 
 # def send_controls_task():
 #     #This is where you send the control commands to the car using the control_conn
@@ -358,12 +472,48 @@ def send_controls_task():
     with data_lock:
         target_lane = shared_data['target_lane']
         danger_detected = shared_data['danger_detected']
+        police_detected = shared_data.get('police_detected', False)
+        trailing_detected = shared_data.get('trailing_detected', False)
+        tokens_snapshot = list(shared_data.get('detected_tokens', []))
     
     # Default values
     steering_input = 0.0
     acceleration_input = 1.0  # Cruise at full speed forward by default
     
     # 2. STATE MACHINE LOGIC
+    # Reaction logic for events detected by vision
+    if police_detected:
+        # Must take next red token: find nearest red token and request its lane
+        red_tokens = [t for t in tokens_snapshot if t.get('color') == 'red']
+        if red_tokens:
+            # pick the red token closest to center x
+            frame_center_x = 320
+            nearest = min(red_tokens, key=lambda t: abs(t['x'] - frame_center_x))
+            desired_lane = lane_from_x(nearest['x'], frame_width=640)
+            with data_lock:
+                shared_data['target_lane'] = desired_lane
+            target_lane = desired_lane
+            print(f"[EVENT] Police behind: requesting lane {desired_lane} to take red token")
+        else:
+            # No red token visible — slow down to avoid penalty
+            acceleration_input = 0.0
+            print("[EVENT] Police behind: no red token visible, braking")
+
+    if trailing_detected:
+        # Try to move to an adjacent lane away from our current lane
+        evasive_lane = current_lane
+        if current_lane < 2:
+            evasive_lane = current_lane + 1
+        elif current_lane > -2:
+            evasive_lane = current_lane - 1
+
+        with data_lock:
+            shared_data['target_lane'] = evasive_lane
+        target_lane = evasive_lane
+        with data_lock:
+            shared_data['danger_detected'] = True
+        print(f"[EVENT] Trailing car detected: requesting evasive lane {evasive_lane}")
+
     if steering_state == 0:
         # STATE 0: IDLE (Wait for a lane change request)
         if target_lane != current_lane:
