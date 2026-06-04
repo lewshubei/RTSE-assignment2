@@ -323,6 +323,7 @@ def detect_colored_tokens(frame):
 
 def draw_detected_tokens(frame, tokens):
     display_frame = frame.copy()
+    frame_h, frame_w = display_frame.shape[:2]
 
     text_colors = {
         "green": (0, 255, 0),
@@ -330,21 +331,60 @@ def draw_detected_tokens(frame, tokens):
         "red": (0, 0, 255)
     }
 
+    # Bottom center of the screen (car's position)
+    car_center = (int(frame_w / 2), frame_h)
+
     for token in tokens:
         color = text_colors.get(token["color"], (255, 255, 255))
         center = (token["x"], token["y"])
         radius = token["radius"]
 
-        cv2.circle(display_frame, center, radius, color, 2)
-        cv2.putText(
-            display_frame,
-            token["color"],
-            (token["x"] - 20, token["y"] - radius - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2
-        )
+        if token["color"] == "green":
+            # Draw bounding box
+            x1 = center[0] - radius
+            y1 = center[1] - radius
+            x2 = center[0] + radius
+            y2 = center[1] + radius
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+
+            # Draw "GRN" text above the bounding box
+            cv2.putText(
+                display_frame,
+                "GRN",
+                (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2
+            )
+
+            # Draw line from car to token center
+            cv2.line(display_frame, car_center, center, color, 2)
+            
+            # Calculate distance and display it on the line
+            distance = ((center[0] - car_center[0])**2 + (center[1] - car_center[1])**2)**0.5
+            mid_point = ((center[0] + car_center[0]) // 2, (center[1] + car_center[1]) // 2)
+            cv2.putText(
+                display_frame,
+                f"Dist: {int(distance)}",
+                mid_point,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                2
+            )
+        else:
+            # Original circle style for other tokens
+            cv2.circle(display_frame, center, radius, color, 2)
+            cv2.putText(
+                display_frame,
+                token["color"],
+                (token["x"] - 20, token["y"] - radius - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2
+            )
 
     return display_frame
 
@@ -629,19 +669,47 @@ def send_controls_task():
     acceleration_input = 1.0  # Cruise at full speed forward by default
     
     # 2. STATE MACHINE LOGIC
-    # Reaction logic for events detected by vision
-    if police_detected:
-        # Must take next red token: find nearest red token and request its lane
-        red_tokens = [t for t in tokens_snapshot if t.get('color') == 'red']
-        if red_tokens:
-            # pick the red token closest to center x
-            frame_center_x = 320
-            nearest = min(red_tokens, key=lambda t: abs(t['x'] - frame_center_x))
-            desired_lane = lane_from_x(nearest['x'], nearest['y'], frame_width=640)
+    
+    # 1. First Priority: Check for green tokens
+    closest_green_lane = None
+    min_distance = float('inf')
+    safe_lanes = set([-2, -1, 0, 1, 2])
+    
+    car_x = 320
+    car_y = 480
+    
+    for t in tokens_snapshot:
+        if t['y'] > 230:
+            lane = lane_from_x(t['x'], t['y'], frame_width=640)
+            if t['color'] == 'green':
+                distance = ((t['x'] - car_x)**2 + (t['y'] - car_y)**2)**0.5
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_green_lane = lane
+            elif t['color'] in ['red', 'yellow']:
+                safe_lanes.discard(lane)
+                
+    if closest_green_lane is not None:
+        desired_lane = closest_green_lane
+        if desired_lane != target_lane:
             with data_lock:
                 shared_data['target_lane'] = desired_lane
             target_lane = desired_lane
-            print(f"[EVENT] Police behind: requesting lane {desired_lane} to take red token")
+            print(f"[EVENT] Green token detected: focusing on moving to lane {desired_lane}")
+            
+    # 2. If no green token, handle special events (police/trailing)
+    elif police_detected:
+        # Must take next red token: find nearest red token and request its lane
+        red_tokens = [t for t in tokens_snapshot if t.get('color') == 'red']
+        if red_tokens:
+            frame_center_x = 320
+            nearest = min(red_tokens, key=lambda t: abs(t['x'] - frame_center_x))
+            desired_lane = lane_from_x(nearest['x'], nearest['y'], frame_width=640)
+            if desired_lane != target_lane:
+                with data_lock:
+                    shared_data['target_lane'] = desired_lane
+                target_lane = desired_lane
+                print(f"[EVENT] Police behind: requesting lane {desired_lane} to take red token")
         else:
             # No red token visible — slow down to avoid penalty
             acceleration_input = 0.0
@@ -655,50 +723,26 @@ def send_controls_task():
         elif current_lane > -2:
             evasive_lane = current_lane - 1
 
-        with data_lock:
-            shared_data['target_lane'] = evasive_lane
-        target_lane = evasive_lane
-        with data_lock:
-            shared_data['danger_detected'] = True
-        print(f"[EVENT] Trailing car detected: requesting evasive lane {evasive_lane}")
+        if evasive_lane != target_lane:
+            with data_lock:
+                shared_data['target_lane'] = evasive_lane
+            target_lane = evasive_lane
+            with data_lock:
+                shared_data['danger_detected'] = True
+            print(f"[EVENT] Trailing car detected: requesting evasive lane {evasive_lane}")
 
     else:
-        # Standard cruising logic: collect green, avoid red/yellow
-        safe_lanes = set([-2, -1, 0, 1, 2])
-        green_lanes = set()
-        
-        for t in tokens_snapshot:
-            # Only consider tokens that are somewhat close (e.g. y > 230) so we don't react too early
-            # and to avoid tokens above the horizon line (y <= 216) which map incorrectly.
-            if t['y'] > 230:
-                lane = lane_from_x(t['x'], t['y'], frame_width=640)
-                if t['color'] in ['red', 'yellow']:
-                    safe_lanes.discard(lane)
-                elif t['color'] == 'green':
-                    green_lanes.add(lane)
-                
+        # 3. Standard cruising: just avoid red/yellow tokens if possible
         desired_lane = target_lane
-        
-        # If current target is unsafe, or we are in an unsafe lane, we must find a new safe lane
         if current_lane not in safe_lanes or target_lane not in safe_lanes:
             if safe_lanes:
-                # Prioritize safe lanes with green tokens
-                safe_green = green_lanes.intersection(safe_lanes)
-                if safe_green:
-                    desired_lane = min(safe_green, key=lambda l: abs(l - current_lane))
-                else:
-                    desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
-        else:
-            # We are safe. Can we grab a green token?
-            safe_green = green_lanes.intersection(safe_lanes)
-            if safe_green and target_lane not in safe_green:
-                desired_lane = min(safe_green, key=lambda l: abs(l - current_lane))
+                desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
 
         if desired_lane != target_lane:
             with data_lock:
                 shared_data['target_lane'] = desired_lane
             target_lane = desired_lane
-            print(f"[CRUISE] Target lane updated to {desired_lane} based on tokens.")
+            print(f"[CRUISE] Target lane updated to {desired_lane} to avoid hazards.")
 
     if steering_state == 0:
         # STATE 0: IDLE (Wait for a lane change request)
