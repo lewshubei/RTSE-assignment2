@@ -697,7 +697,7 @@ def send_controls_task():
         if t['y'] > 230:
             rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
             abs_lane = max(-2, min(2, current_lane + rel_lane))
-            if t['color'] == 'green' and abs_lane in safe_lanes:
+            if t['color'] == 'green' and abs_lane in safe_lanes and abs(abs_lane - current_lane) <= 1:
                 distance = ((t['x'] - car_x)**2 + (t['y'] - car_y)**2)**0.5
                 if distance < min_distance:
                     min_distance = distance
