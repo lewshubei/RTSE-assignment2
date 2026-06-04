@@ -241,7 +241,7 @@ def detect_colored_tokens(frame):
 
     color_ranges = {
         "green": [
-            ((35, 80, 80), (85, 255, 255))
+            ((35, 40, 40), (90, 255, 255))
         ],
         "yellow": [
             ((20, 80, 80), (35, 255, 255))
@@ -308,7 +308,7 @@ def detect_colored_tokens(frame):
             if y <= vp_y + 5:
                 continue
             slope = (x - vp_x) / (y - vp_y)
-            if slope < -0.85 or slope > 0.85:
+            if slope < -1.5 or slope > 1.5:
                 continue
 
             detected_tokens.append({
@@ -657,8 +657,9 @@ def send_controls_task():
     if current_time - last_collected_time > 0.4:
         for t in tokens_snapshot:
             if t['y'] > 350:
-                t_lane = lane_from_x(t['x'], t['y'], frame_width=640)
-                if t_lane == current_lane:
+                rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
+                abs_lane = max(-2, min(2, current_lane + rel_lane))
+                if abs_lane == current_lane:
                     with data_lock:
                         shared_data['run_summary'][f"{t['color']}_collected"] += 1
                         shared_data['last_collected_time'] = current_time
@@ -680,14 +681,15 @@ def send_controls_task():
     
     for t in tokens_snapshot:
         if t['y'] > 230:
-            lane = lane_from_x(t['x'], t['y'], frame_width=640)
+            rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
+            abs_lane = max(-2, min(2, current_lane + rel_lane))
             if t['color'] == 'green':
                 distance = ((t['x'] - car_x)**2 + (t['y'] - car_y)**2)**0.5
                 if distance < min_distance:
                     min_distance = distance
-                    closest_green_lane = lane
+                    closest_green_lane = abs_lane
             elif t['color'] in ['red', 'yellow']:
-                safe_lanes.discard(lane)
+                safe_lanes.discard(abs_lane)
                 
     if closest_green_lane is not None:
         desired_lane = closest_green_lane
@@ -704,7 +706,8 @@ def send_controls_task():
         if red_tokens:
             frame_center_x = 320
             nearest = min(red_tokens, key=lambda t: abs(t['x'] - frame_center_x))
-            desired_lane = lane_from_x(nearest['x'], nearest['y'], frame_width=640)
+            rel_lane = lane_from_x(nearest['x'], nearest['y'], frame_width=640)
+            desired_lane = max(-2, min(2, current_lane + rel_lane))
             if desired_lane != target_lane:
                 with data_lock:
                     shared_data['target_lane'] = desired_lane
@@ -802,7 +805,7 @@ if __name__ == '__main__':
                     shared_data['target_lane'] = lane
                 time.sleep(4)
 
-    ENABLE_LANE_SWITCH_TEST = True
+    ENABLE_LANE_SWITCH_TEST = False
 
     print("Initializing RTSE Sample Drive...")
 
