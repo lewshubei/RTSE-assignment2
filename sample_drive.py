@@ -241,7 +241,7 @@ def detect_colored_tokens(frame):
 
     color_ranges = {
         "green": [
-            ((35, 40, 40), (90, 255, 255))
+            ((35, 15, 80), (95, 255, 255))
         ],
         "yellow": [
             ((20, 80, 80), (35, 255, 255))
@@ -289,13 +289,18 @@ def detect_colored_tokens(frame):
             circularity = 4 * np.pi * area / (perimeter * perimeter)
             # A perfect circle has a circularity of 1.0. A square is ~0.78.
             # Curbs are long and irregular, so they will have a much lower circularity.
-            if circularity < 0.6:
+            min_circularity = 0.5 if color_name == 'green' else 0.75
+            if circularity < min_circularity:
                 continue
 
             # Ensure the bounding box is somewhat square (since tokens are round)
             bx, by, bw, bh = cv2.boundingRect(contour)
             aspect_ratio = float(bw) / bh if bh > 0 else 0.0
-            if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+            
+            min_aspect = 0.5 if color_name == 'green' else 0.75
+            max_aspect = 2.0 if color_name == 'green' else 1.35
+            
+            if aspect_ratio < min_aspect or aspect_ratio > max_aspect:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
@@ -679,18 +684,26 @@ def send_controls_task():
     car_x = 320
     car_y = 480
     
+    # Pass 1: Identify hazard lanes (red/yellow)
     for t in tokens_snapshot:
         if t['y'] > 230:
             rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
             abs_lane = max(-2, min(2, current_lane + rel_lane))
-            if t['color'] == 'green':
+            if t['color'] in ['red', 'yellow']:
+                safe_lanes.discard(abs_lane)
+                
+    # Pass 2: Find the closest green token in a safe lane
+    for t in tokens_snapshot:
+        if t['y'] > 230:
+            rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
+            abs_lane = max(-2, min(2, current_lane + rel_lane))
+            if t['color'] == 'green' and abs_lane in safe_lanes:
                 distance = ((t['x'] - car_x)**2 + (t['y'] - car_y)**2)**0.5
                 if distance < min_distance:
                     min_distance = distance
                     closest_green_lane = abs_lane
-            elif t['color'] in ['red', 'yellow']:
-                safe_lanes.discard(abs_lane)
                 
+    # 1. First Priority: Check for green tokens
     if closest_green_lane is not None:
         desired_lane = closest_green_lane
         if desired_lane != target_lane:
