@@ -234,102 +234,149 @@ def adjust_gamma(image, gamma=1.5):
 def detect_colored_tokens(frame):
     """
     Detect green, yellow, and red circular tokens from the front camera.
-    Red detection ignores vehicle and road edges using ROI and area/circularity filters.
-    Applies gamma correction for distant tokens.
+
+    Red tokens are pale pink/red because of their gradient.  They need a
+    separate mask made from the original frame.  The red road markings and
+    the player's car are normally much more saturated, so an upper saturation
+    limit is used to reject them.
     """
     frame_h, frame_w = frame.shape[:2]
 
-    # Brighten frame for distant tokens
+    # Gamma correction is useful for distant green and yellow tokens.
     frame_bright = adjust_gamma(frame, gamma=1.5)
-    hsv = cv2.cvtColor(frame_bright, cv2.COLOR_BGR2HSV)
+    hsv_bright = cv2.cvtColor(frame_bright, cv2.COLOR_BGR2HSV)
 
-    # HSV ranges
-    color_ranges = {
-        "green": [((50, 30, 150), (70, 255, 255))],
-        "yellow": [((18, 50, 140), (30, 255, 255))],
-        "red": [
-            # Red tokens in this scene are bright but often slightly pink after gamma correction.
-            # Widen the hue and saturation/value ranges so the detector keeps them.
-            ((0, 90, 120), (15, 255, 255)),
-            ((165, 90, 120), (180, 255, 255))
-        ]
-    }
+    # Use the original image for red. Gamma correction reduces the saturation
+    # contrast of the pale red token and can leave only a fragmented contour.
+    hsv_original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     detected_tokens = []
-    kernel = np.ones((5, 5), np.uint8)
+    standard_kernel = np.ones((5, 5), np.uint8)
 
-    road_polygon = np.array([
-        [int(frame_w * 0.12), frame_h - 1],
-        [int(frame_w * 0.32), int(frame_h * 0.42)],
-        [int(frame_w * 0.68), int(frame_h * 0.42)],
-        [int(frame_w * 0.88), frame_h - 1]
-    ], dtype=np.int32)
+    # -----------------------------------------------------
+    # Green and yellow detection
+    # -----------------------------------------------------
+    standard_color_ranges = {
+        "green": [((50, 30, 150), (70, 255, 255))],
+        "yellow": [((18, 50, 140), (30, 255, 255))]
+    }
 
-    for color_name, ranges in color_ranges.items():
-        # ROI for red only
-        if color_name == "red":
-            roi_x1 = int(frame_w * 0.02)
-            roi_x2 = int(frame_w * 0.98)
-            roi_y1 = 0
-            roi_y2 = int(frame_h * 0.92)
-            roi = hsv[roi_y1:roi_y2, roi_x1:roi_x2]
-        else:
-            roi_x1, roi_y1 = 0, 0
-            roi_x2, roi_y2 = frame_w, frame_h
-            roi = hsv
-
-        # Combine masks for multiple ranges
+    for color_name, ranges in standard_color_ranges.items():
         color_mask = None
+
         for lower, upper in ranges:
-            lower_np = np.array(lower, dtype=np.uint8)
-            upper_np = np.array(upper, dtype=np.uint8)
-            current_mask = cv2.inRange(roi, lower_np, upper_np)
-            if color_mask is None:
-                color_mask = current_mask
-            else:
-                color_mask = cv2.bitwise_or(color_mask, current_mask)
+            current_mask = cv2.inRange(
+                hsv_bright,
+                np.array(lower, dtype=np.uint8),
+                np.array(upper, dtype=np.uint8)
+            )
+            color_mask = current_mask if color_mask is None else cv2.bitwise_or(color_mask, current_mask)
 
-        # Morphology
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, standard_kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, standard_kernel)
 
-        # Find contours
         contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 100:
+            if area < 100 or area > 300000:
                 continue
-            if color_name == "red":
-                if area > 300000:
-                    continue
-            elif area > 300000:
-                continue
+
             perimeter = cv2.arcLength(cnt, True)
             if perimeter == 0:
                 continue
+
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if color_name == "green":
-                min_circularity = 0.5
-            elif color_name == "red":
-                min_circularity = 0.6
-            else:
-                min_circularity = 0.75
+            min_circularity = 0.50 if color_name == "green" else 0.75
             if circularity < min_circularity:
                 continue
+
             (x, y), radius = cv2.minEnclosingCircle(cnt)
-            center = (int(x) + roi_x1, int(y) + roi_y1)
-            if color_name == "red":
-                # Keep red tokens only when they lie on the road surface, not on the roadside signs/grass.
-                bottom_center = (float(center[0]), float(min(center[1] + radius * 0.8, frame_h - 1)))
-                if cv2.pointPolygonTest(road_polygon, bottom_center, False) < 0:
-                    continue
             detected_tokens.append({
                 "color": color_name,
-                "x": center[0],
-                "y": center[1],
+                "x": int(x),
+                "y": int(y),
                 "radius": int(radius),
                 "area": float(area)
             })
+
+    # -----------------------------------------------------
+    # Red token detection
+    # -----------------------------------------------------
+    # OpenCV hue wraps around: red exists near both 0 and 179.
+    #
+    # The token is a light pink/red gradient. Saturation is deliberately
+    # limited to 20..200 to retain the pale token while rejecting strongly
+    # saturated red road borders and most of the player's red car.
+    red_mask_1 = cv2.inRange(
+        hsv_original,
+        np.array((0, 20, 145), dtype=np.uint8),
+        np.array((20, 200, 255), dtype=np.uint8)
+    )
+    red_mask_2 = cv2.inRange(
+        hsv_original,
+        np.array((160, 20, 145), dtype=np.uint8),
+        np.array((179, 200, 255), dtype=np.uint8)
+    )
+    red_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
+
+    # Close first to reconnect the token's gradient. Use a smaller opening
+    # kernel afterwards so distant tokens are not erased.
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Scale the minimum area so the detector works at different resolutions.
+    red_min_area = max(70.0, frame_w * frame_h * 0.00030)
+    red_max_area = frame_w * frame_h * 0.20
+
+    for cnt in red_contours:
+        area = cv2.contourArea(cnt)
+        if area < red_min_area or area > red_max_area:
+            continue
+
+        x, y, width, height = cv2.boundingRect(cnt)
+        if height == 0:
+            continue
+
+        aspect_ratio = width / float(height)
+        if not (0.58 <= aspect_ratio <= 1.55):
+            continue
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        (center_x, center_y), radius = cv2.minEnclosingCircle(cnt)
+
+        if radius <= 0:
+            continue
+
+        circle_fill_ratio = area / (np.pi * radius * radius)
+
+        # These filters retain round red tokens while rejecting thin road
+        # markings, roadside arrows and irregular red parts of the car.
+        if circularity < 0.46 or circle_fill_ratio < 0.43:
+            continue
+
+        # Ignore HUD text at the top and small fragments near the bottom edge.
+        if center_y < frame_h * 0.20 or center_y > frame_h * 0.92:
+            continue
+
+        detected_tokens.append({
+            "color": "red",
+            "x": int(center_x),
+            "y": int(center_y),
+            "radius": int(radius),
+            "area": float(area)
+        })
+
+    # Optional tuning window. Uncomment temporarily if you need to inspect
+    # which pixels are selected as red:
+    # cv2.imshow("Red Token Mask", cv2.resize(red_mask, (640, 480)))
+    # cv2.waitKey(1)
 
     return detected_tokens
 
