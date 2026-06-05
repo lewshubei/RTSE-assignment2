@@ -703,12 +703,31 @@ def send_controls_task():
                 
     # 1. First Priority: Check for green tokens
     if closest_green_lane is not None:
-        desired_lane = closest_green_lane
+        # Step 1: determine direction
+        step_direction = 0
+        if closest_green_lane > current_lane:
+            step_direction = 1
+        elif closest_green_lane < current_lane:
+            step_direction = -1
+        
+        next_lane = current_lane + step_direction
+
+        # Step 2: check if next lane is safe
+        if next_lane in safe_lanes:
+            desired_lane = next_lane
+        else:
+            # Step 3: find nearest safe lane
+            candidates = [l for l in safe_lanes if l != current_lane]
+            if candidates:
+                desired_lane = min(candidates, key=lambda l: abs(l - current_lane))
+            else:
+                desired_lane = current_lane
+
+        # Step 4: update shared target lane
         if desired_lane != target_lane:
             with data_lock:
                 shared_data['target_lane'] = desired_lane
             target_lane = desired_lane
-            print(f"[EVENT] Green token detected: focusing on moving to lane {desired_lane}")
             
     # 2. If no green token, handle special events (police/trailing)
     elif police_detected:
