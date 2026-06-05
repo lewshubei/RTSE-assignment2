@@ -226,98 +226,85 @@ def read_front_camera_task():
 
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame', display=False)
-
+def adjust_gamma(image, gamma=1.5):
+    invGamma = 1.0 / gamma
+    table = np.array([((i/255.0) ** invGamma) * 255
+                      for i in np.arange(256)]).astype("uint8")
+    return cv2.LUT(image, table)
 def detect_colored_tokens(frame):
     """
     Detect green, yellow, and red circular tokens from the front camera.
-
-    Output format:
-    [
-        {"color": "green", "x": 320, "y": 240, "radius": 25, "area": 1800.0},
-        ...
-    ]
+    Red detection ignores vehicle and road edges using ROI and area/circularity filters.
+    Applies gamma correction for distant tokens.
     """
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    frame_h, frame_w = frame.shape[:2]
 
+    # Brighten frame for distant tokens
+    frame_bright = adjust_gamma(frame, gamma=1.5)
+    hsv = cv2.cvtColor(frame_bright, cv2.COLOR_BGR2HSV)
+
+    # HSV ranges
     color_ranges = {
-        "green": [
-            ((57, 37, 166), (64, 144, 222)) 
-        ],
-         "yellow": [((18, 62, 149), (29, 218, 255))],
-    "red": [
-        ((0, 32, 234), (2, 150, 252)),
-        ((170, 80, 80), (180, 255, 255))
-    ]
+        "green": [((50, 30, 150), (70, 255, 255))],
+        "yellow": [((18, 50, 140), (30, 255, 255))],
+        "red": [
+            ((0, 150, 200), (10, 255, 255)),
+            ((170, 150, 200), (180, 255, 255))
+        ]
     }
 
     detected_tokens = []
     kernel = np.ones((5, 5), np.uint8)
 
     for color_name, ranges in color_ranges.items():
-        color_mask = None
+        # ROI for red only
+        if color_name == "red":
+            roi_x1 = int(frame_w * 0.05)
+            roi_x2 = int(frame_w * 0.95)
+            roi_y1 = 0
+            roi_y2 = int(frame_h * 0.7)
+            roi = hsv[roi_y1:roi_y2, roi_x1:roi_x2]
+        else:
+            roi_x1, roi_y1 = 0, 0
+            roi_x2, roi_y2 = frame_w, frame_h
+            roi = hsv
 
+        # Combine masks for multiple ranges
+        color_mask = None
         for lower, upper in ranges:
             lower_np = np.array(lower, dtype=np.uint8)
             upper_np = np.array(upper, dtype=np.uint8)
-            current_mask = cv2.inRange(hsv, lower_np, upper_np)
-
+            current_mask = cv2.inRange(roi, lower_np, upper_np)
             if color_mask is None:
                 color_mask = current_mask
             else:
                 color_mask = cv2.bitwise_or(color_mask, current_mask)
 
+        # Morphology
         color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
         color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(
-            color_mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 100:
+        # Find contours
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 100 or area > 5000:
                 continue
-
-            perimeter = cv2.arcLength(contour, True)
+            perimeter = cv2.arcLength(cnt, True)
             if perimeter == 0:
                 continue
-
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            # A perfect circle has a circularity of 1.0. A square is ~0.78.
-            # Curbs are long and irregular, so they will have a much lower circularity.
-            min_circularity = 0.5 if color_name == 'green' else 0.75
+            min_circularity = 0.5 if color_name == "green" else 0.75
             if circularity < min_circularity:
                 continue
-
-            # Ensure the bounding box is somewhat square (since tokens are round)
-            bx, by, bw, bh = cv2.boundingRect(contour)
-            aspect_ratio = float(bw) / bh if bh > 0 else 0.0
-            
-            min_aspect = 0.5 if color_name == 'green' else 0.75
-            max_aspect = 2.0 if color_name == 'green' else 1.35
-            
-            if aspect_ratio < min_aspect or aspect_ratio > max_aspect:
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
+            center = (int(x) + roi_x1, int(y) + roi_y1)
+            if color_name == "red" and center[1] > roi_y2:
                 continue
-
-            (x, y), radius = cv2.minEnclosingCircle(contour)
-            if radius < 5:
-                continue
-
-            frame_h, frame_w = frame.shape[:2]
-            vp_x = frame_w / 2.0
-            vp_y = frame_h * 0.45
-            if y <= vp_y + 5:
-                continue
-            slope = (x - vp_x) / (y - vp_y)
-            if slope < -1.5 or slope > 1.5:
-                continue
-
             detected_tokens.append({
                 "color": color_name,
-                "x": int(x),
-                "y": int(y),
+                "x": center[0],
+                "y": center[1],
                 "radius": int(radius),
                 "area": float(area)
             })
@@ -326,7 +313,7 @@ def detect_colored_tokens(frame):
 
 def draw_detected_tokens(frame, tokens):
     """
-    Draws bounding boxes for each detected token while keeping the original frame visible.
+    Draw bounding boxes and semi-transparent overlays for all detected tokens.
     """
     display_frame = frame.copy()
     frame_h, frame_w = display_frame.shape[:2]
@@ -337,25 +324,26 @@ def draw_detected_tokens(frame, tokens):
         "red": (0, 0, 255)
     }
 
+    overlay = display_frame.copy()
     for token in tokens:
         color = text_colors.get(token["color"], (255, 255, 255))
         center = (token["x"], token["y"])
         radius = token["radius"]
-
+        # Semi-transparent filled circle
+        cv2.circle(overlay, center, radius, color, -1)
         # Bounding box
-        x1 = max(center[0] - radius, 0)
-        y1 = max(center[1] - radius, 0)
-        x2 = min(center[0] + radius, frame_w - 1)
-        y2 = min(center[1] + radius, frame_h - 1)
-
-        # Draw rectangle
+        x1 = max(center[0]-radius, 0)
+        y1 = max(center[1]-radius, 0)
+        x2 = min(center[0]+radius, frame_w-1)
+        y2 = min(center[1]+radius, frame_h-1)
         cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-
-        # Draw color name above the rectangle
-        cv2.putText(display_frame, token["color"].upper(),
-                    (x1, y1 - 10),
+        # Color label
+        cv2.putText(display_frame, token["color"].upper(), (x1, y1-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+    # Blend overlay with original frame
+    alpha = 0.3
+    cv2.addWeighted(overlay, alpha, display_frame, 1-alpha, 0, display_frame)
     return display_frame
 
 
