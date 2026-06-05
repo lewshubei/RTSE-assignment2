@@ -601,64 +601,42 @@ def send_controls_task():
     if control_conn is None:
         return
     
-    # 1. Read the decisions made from shared memory safely
+    # Read shared data
     with data_lock:
-        target_lane = shared_data['target_lane']
-        
-        police_detected = shared_data.get('police_detected', False)
-        trailing_detected = shared_data.get('trailing_detected', False)
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
-        last_collected_time = shared_data.get('last_collected_time', 0.0)
+        target_lane = shared_data['target_lane']
     
-    # 1.5. Check for collected tokens (estimate based on position and lane)
-    current_time = time.time()
-    if current_time - last_collected_time > 0.4:
-        for t in tokens_snapshot:
-            if t['y'] > 350:
-                rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
-                abs_lane = max(-2, min(2, current_lane + rel_lane))
-                if abs_lane == current_lane:
-                    with data_lock:
-                        shared_data['run_summary'][f"{t['color']}_collected"] += 1
-                        shared_data['last_collected_time'] = current_time
-                    break
-    
-    # Default values
+    # Default control
     steering_input = 0.0
-    acceleration_input = 1.0  # Cruise at full speed forward by default
-    
-    # 2. STATE MACHINE LOGIC
-    
-    # 1. First Priority: Check for green tokens
-    closest_green_lane = None
-    min_distance = float('inf')
-    safe_lanes = set([-2, -1, 0, 1, 2])
-    
+    acceleration_input = 1.0  # always move forward
+
     car_x = 320
     car_y = 480
-    
-    # Pass 1: Identify hazard lanes (red/yellow)
+    safe_lanes = set([-2, -1, 0, 1, 2])
+    closest_green_lane = None
+    min_distance = float('inf')
+
+    # Identify hazard lanes (yellow/red)
     for t in tokens_snapshot:
         if t['y'] > 230:
             rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
             abs_lane = max(-2, min(2, current_lane + rel_lane))
             if t['color'] in ['red', 'yellow']:
                 safe_lanes.discard(abs_lane)
-                
-    # Pass 2: Find the closest green token in a safe lane
+
+    # Find closest green token in a safe lane
     for t in tokens_snapshot:
         if t['y'] > 230:
             rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
             abs_lane = max(-2, min(2, current_lane + rel_lane))
-            if t['color'] == 'green' and abs_lane in safe_lanes and abs(abs_lane - current_lane) <= 1:
+            if t['color'] == 'green' and abs_lane in safe_lanes:
                 distance = ((t['x'] - car_x)**2 + (t['y'] - car_y)**2)**0.5
                 if distance < min_distance:
                     min_distance = distance
                     closest_green_lane = abs_lane
-                
-    # 1. First Priority: Check for green tokens
+
+    # Decide next lane
     if closest_green_lane is not None:
-        # Step 1: determine direction
         step_direction = 0
         if closest_green_lane > current_lane:
             step_direction = 1
@@ -666,115 +644,57 @@ def send_controls_task():
             step_direction = -1
         
         next_lane = current_lane + step_direction
-
-        # Step 2: check if next lane is safe
+        # move only if next lane is safe
         if next_lane in safe_lanes:
             desired_lane = next_lane
         else:
-            # Step 3: find nearest safe lane
+            # pick nearest safe lane
             candidates = [l for l in safe_lanes if l != current_lane]
             if candidates:
                 desired_lane = min(candidates, key=lambda l: abs(l - current_lane))
             else:
                 desired_lane = current_lane
 
-        # Step 4: update shared target lane
         if desired_lane != target_lane:
             with data_lock:
                 shared_data['target_lane'] = desired_lane
             target_lane = desired_lane
-            
-    # 2. If no green token, handle special events (police/trailing)
-    elif police_detected:
-        # Must take next red token: find nearest red token and request its lane
-        red_tokens = [t for t in tokens_snapshot if t.get('color') == 'red']
-        if red_tokens:
-            frame_center_x = 320
-            nearest = min(red_tokens, key=lambda t: abs(t['x'] - frame_center_x))
-            rel_lane = lane_from_x(nearest['x'], nearest['y'], frame_width=640)
-            desired_lane = max(-2, min(2, current_lane + rel_lane))
-            if desired_lane != target_lane:
+
+    else:
+        # No green token visible, just stay in current lane or move to safe lane
+        if current_lane not in safe_lanes:
+            if safe_lanes:
+                desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
                 with data_lock:
                     shared_data['target_lane'] = desired_lane
                 target_lane = desired_lane
-                print(f"[EVENT] Police behind: requesting lane {desired_lane} to take red token")
-        else:
-            # No red token visible — slow down to avoid penalty
-            acceleration_input = 0.0
-            print("[EVENT] Police behind: no red token visible, braking")
 
-    elif trailing_detected:
-        # Try to move to an adjacent lane away from our current lane
-        evasive_lane = current_lane
-        if current_lane < 2:
-            evasive_lane = current_lane + 1
-        elif current_lane > -2:
-            evasive_lane = current_lane - 1
-
-        if evasive_lane != target_lane:
-            with data_lock:
-                shared_data['target_lane'] = evasive_lane
-            target_lane = evasive_lane
-            with data_lock:
-                shared_data['danger_detected'] = True
-            print(f"[EVENT] Trailing car detected: requesting evasive lane {evasive_lane}")
-
-    else:
-        # 3. Standard cruising: just avoid red/yellow tokens if possible
-        desired_lane = target_lane
-        if current_lane not in safe_lanes or target_lane not in safe_lanes:
-            if safe_lanes:
-                desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
-
-        if desired_lane != target_lane:
-            with data_lock:
-                shared_data['target_lane'] = desired_lane
-            target_lane = desired_lane
-            print(f"[CRUISE] Target lane updated to {desired_lane} to avoid hazards.")
-
+    # Lane change state machine (unchanged)
     if steering_state == 0:
-        # STATE 0: IDLE (Wait for a lane change request)
         if target_lane != current_lane:
-            steering_state = 1  # Trigger a tap maneuver!
-            tap_loop_count = 0  # Reset our timer counter
-            print(f"[CONTROL] Lane change requested from {current_lane} to {target_lane}")
-            
+            steering_state = 1
+            tap_loop_count = 0
     elif steering_state == 1:
-        # STATE 1: TAPPING (Actively turning the wheel)
-        if target_lane > current_lane:
-            steering_input = 1.0   # Tap Right
-        else:
-            steering_input = -1.0  # Tap Left
-            
+        steering_input = 1.0 if target_lane > current_lane else -1.0
         tap_loop_count += 1
-        
-        
         if tap_loop_count >= 10:
-            steering_state = 2  # Turn finished, proceed to reset step
-            tap_loop_count = 0  # Reset counter
-            if target_lane > current_lane:
-                current_lane += 1
-            elif target_lane < current_lane:
-                current_lane -= 1
-            
+            steering_state = 2
+            tap_loop_count = 0
+            current_lane += 1 if target_lane > current_lane else -1
     elif steering_state == 2:
-        # STATE 2: RESETTING (Force wheel back to center before doing anything else)
         steering_input = 0.0
         tap_loop_count += 1
-        
-        # Hold the wheel steady for 5 loops to stabilize the car body
         if tap_loop_count >= 5:
-            steering_state = 0  # Done! Return to idle mode
-            print("[CONTROL] Lane change maneuver completed successfully.")
+            steering_state = 0
 
-    # 3. Pack and send the automated floating-point values to the simulator
+    # Send controls
     try:
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
-        control_conn = None
-# ---------------------------------------------------------
+        control_conn = None 
+#---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
 if __name__ == '__main__':
