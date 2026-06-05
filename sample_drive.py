@@ -19,6 +19,10 @@ CONTROL_PORT = 8081
 START_LANE = 0
 START_CENTER_HOLD_SECONDS = 2.0
 CAR_ACCELERATION = 0.78
+GREEN_CHASE_ACCELERATION = 0.62
+GREEN_STEER_GAIN = 2.8
+GREEN_STEER_DEADZONE = 0.015
+GREEN_MIN_STEER = 0.18
 MIN_LOOKAHEAD_Y_RATIO = 0.25
 LINE_GROUP_Y_RATIO = 0.08
 LANE_CHANGE_TIME_Y_RATIO = 0.14
@@ -52,7 +56,8 @@ shared_data.update({
         'trailing_appeared': False
     },
     'last_collected_time': 0.0,
-    'last_collected_line_id': None
+    'last_collected_line_id': None,
+    'last_collected_by_lane_color': {}
 })
 data_lock = threading.Lock()
 is_running = True
@@ -607,13 +612,9 @@ def processing_task():
 
         with data_lock:
             shared_data['detected_tokens'] = tokens
-            decision_debug = shared_data.get('decision_debug', '')
 
         debug_frame = draw_detected_tokens(front_frame, tokens)
         debug_frame = cv2.resize(debug_frame, (640, 480))
-        if decision_debug:
-            cv2.putText(debug_frame, decision_debug, (10, 460),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         cv2.imshow("Front Camera", debug_frame)
         cv2.waitKey(1)
 
@@ -721,6 +722,8 @@ def send_controls_task():
     target_token_y = 0
     decision_reason = "NO_GREEN"
     green_candidates = []
+    token_candidates = []
+    bad_lanes = set()
     if front_frame is not None:
         decision_frame_height, decision_frame_width = front_frame.shape[:2]
     else:
@@ -728,9 +731,6 @@ def send_controls_task():
 
     # Only green tokens are allowed to become steering targets.
     for t in tokens_snapshot:
-        if t.get('color') != 'green':
-            continue
-
         token_lane = lane_from_x(
             t['x'],
             t['y'],
@@ -738,14 +738,32 @@ def send_controls_task():
             frame_height=decision_frame_height
         )
         token_lane = max(-2, min(2, token_lane))
+        token_color = t.get('color')
+        token_candidates.append({
+            'lane': token_lane,
+            'color': token_color,
+            'x': t['x'],
+            'y': t['y'],
+            'line_id': int(t['y'] // max(1, decision_frame_height * LINE_GROUP_Y_RATIO))
+        })
+
+        if token_color in ['red', 'yellow'] and t['y'] > decision_frame_height * 0.35:
+            bad_lanes.add(token_lane)
+
+        if token_color != 'green':
+            continue
+
         y_until_car = max(0.0, decision_frame_height - t['y'])
+        reachable_lane_changes = 1 + int(y_until_car / max(1.0, decision_frame_height * LANE_CHANGE_TIME_Y_RATIO))
         distance_to_car = ((t['x'] - decision_frame_width / 2.0)**2 + y_until_car**2)**0.5
         green_candidates.append({
             'lane': token_lane,
-            'color': t['color'],
+            'color': token_color,
+            'x': t['x'],
             'y': t['y'],
             'line_id': int(t['y'] // max(1, decision_frame_height * LINE_GROUP_Y_RATIO)),
             'lane_change': abs(token_lane - current_lane),
+            'is_reachable': abs(token_lane - current_lane) <= reachable_lane_changes,
             'distance_to_car': distance_to_car
         })
 
@@ -754,6 +772,7 @@ def send_controls_task():
         best_token = min(
             green_candidates,
             key=lambda token: (
+                0 if token['is_reachable'] else 1,
                 -token['y'],
                 token['lane_change'],
                 token['distance_to_car']
@@ -767,18 +786,6 @@ def send_controls_task():
         last_token_lane = target_token_lane
         last_token_time = time.time()
         decision_reason = "GREEN"
-
-        now = time.time()
-        car_is_committed_to_lane = target_token_lane == target_lane or target_token_lane == current_lane
-        if target_token_color is not None and target_token_y > decision_frame_height * 0.62 and car_is_committed_to_lane:
-            line_id = best_token['line_id']
-            with data_lock:
-                if shared_data.get('last_collected_line_id') != line_id:
-                    summary_key = f"{target_token_color}_collected"
-                    if summary_key in shared_data['run_summary']:
-                        shared_data['run_summary'][summary_key] += 1
-                        shared_data['last_collected_time'] = now
-                        shared_data['last_collected_line_id'] = line_id
     elif locked_green_lane is not None and time.time() < locked_green_until:
         target_token_lane = locked_green_lane
         decision_reason = "GREEN_LOCK"
@@ -786,10 +793,37 @@ def send_controls_task():
         locked_green_lane = None
         locked_green_until = 0.0
 
+    now = time.time()
+    for token in token_candidates:
+        token_color = token.get('color')
+        if token_color not in ['green', 'red', 'yellow']:
+            continue
+        if token['lane'] != current_lane or token['y'] <= decision_frame_height * 0.62:
+            continue
+
+        collection_key = (token_color, token['lane'])
+        with data_lock:
+            last_seen = shared_data['last_collected_by_lane_color'].get(collection_key, 0.0)
+            if now - last_seen < 0.75:
+                continue
+
+            summary_key = f"{token_color}_collected"
+            if summary_key in shared_data['run_summary']:
+                shared_data['run_summary'][summary_key] += 1
+                shared_data['last_collected_time'] = now
+                shared_data['last_collected_line_id'] = token['line_id']
+                shared_data['last_collected_by_lane_color'][collection_key] = now
+
     if target_token_lane is None and last_token_lane is not None:
         if time.time() - last_token_time < 1.0:
             target_token_lane = last_token_lane
             decision_reason = "GREEN_MEMORY"
+
+    if target_token_lane is None and current_lane in bad_lanes:
+        safe_lanes = [lane for lane in [-2, -1, 0, 1, 2] if lane not in bad_lanes]
+        if safe_lanes:
+            target_token_lane = min(safe_lanes, key=lambda lane: (abs(lane - current_lane), abs(lane)))
+            decision_reason = "AVOID_BAD"
 
     if target_token_lane is None:
         target_lane = current_lane
@@ -800,30 +834,43 @@ def send_controls_task():
             shared_data['target_lane'] = current_lane
         decision_reason = "NO_GREEN_HOLD"
 
-    # Decide next lane only when the previous lane change has finished.
-    if steering_state == 0:
-        if target_token_lane is not None:
+    # Green decisions can override an old avoid/hold target immediately.
+    # Avoidance decisions wait until the current lane-change tap is finished.
+    if target_token_lane is not None:
+        can_update_target = steering_state == 0 or decision_reason.startswith("GREEN")
+        if can_update_target:
             step_direction = 0
             if target_token_lane > current_lane:
                 step_direction = 1
             elif target_token_lane < current_lane:
                 step_direction = -1
-            
+
             desired_lane = current_lane + step_direction
+
+            if desired_lane in bad_lanes and not decision_reason.startswith("GREEN"):
+                safe_lanes = [lane for lane in [-2, -1, 0, 1, 2] if lane not in bad_lanes]
+                if current_lane in safe_lanes:
+                    desired_lane = current_lane
+                    decision_reason = "STEP_BLOCKED"
+                elif safe_lanes:
+                    desired_lane = min(safe_lanes, key=lambda lane: (abs(lane - current_lane), abs(lane)))
+                    decision_reason = "AVOID_BAD"
 
             if desired_lane != target_lane:
                 with data_lock:
                     shared_data['target_lane'] = desired_lane
                 target_lane = desired_lane
-
-        else:
-            target_lane = current_lane
-            with data_lock:
-                shared_data['target_lane'] = current_lane
+    elif steering_state == 0:
+        target_lane = current_lane
+        with data_lock:
+            shared_data['target_lane'] = current_lane
 
     with data_lock:
+        green_offset_debug = 0.0
+        if best_token is not None:
+            green_offset_debug = (best_token['x'] - decision_frame_width / 2.0) / max(1.0, decision_frame_width / 2.0)
         shared_data['decision_debug'] = (
-            f"{decision_reason} greens={len(green_candidates)} cur={current_lane} tgt={target_lane} green={target_token_lane}"
+            f"{decision_reason} greens={len(green_candidates)} bad={len(bad_lanes)} cur={current_lane} tgt={target_lane} goal={target_token_lane} x={green_offset_debug:.2f}"
         )
 
     # Lane change state machine (unchanged)
@@ -849,6 +896,18 @@ def send_controls_task():
         tap_loop_count += 1
         if tap_loop_count >= STEER_RESET_LOOPS:
             steering_state = 0
+
+    if best_token is not None and decision_reason == "GREEN":
+        acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
+        green_x_offset = (best_token['x'] - decision_frame_width / 2.0) / max(1.0, decision_frame_width / 2.0)
+        if abs(green_x_offset) > GREEN_STEER_DEADZONE:
+            steering_input = max(-1.0, min(1.0, green_x_offset * GREEN_STEER_GAIN))
+            if abs(steering_input) < GREEN_MIN_STEER:
+                steering_input = GREEN_MIN_STEER if steering_input > 0 else -GREEN_MIN_STEER
+        else:
+            steering_input = 0.0
+    elif steering_state == 1:
+        acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
 
     # Send controls
     try:
