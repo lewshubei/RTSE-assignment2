@@ -33,7 +33,15 @@ shared_data.update({
     'police_detected': False,
     'trailing_detected': False,
     'back_prev_gray': None,
-    'back_prev_area': 0.0
+    'back_prev_area': 0.0,
+    'run_summary': {
+        'green_collected': 0,
+        'red_collected': 0,
+        'yellow_collected': 0,
+        'police_appeared': False,
+        'trailing_appeared': False
+    },
+    'last_collected_time': 0.0
 })
 data_lock = threading.Lock()
 is_running = True
@@ -214,86 +222,76 @@ def read_single_camera(sock, window_name, data_key, display=True):
         pass
 
 def read_front_camera_task():
-    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
+    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame', display=False)
 
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame', display=False)
-
+def adjust_gamma(image, gamma=1.5):
+    invGamma = 1.0 / gamma
+    table = np.array([((i/255.0) ** invGamma) * 255
+                      for i in np.arange(256)]).astype("uint8")
+    return cv2.LUT(image, table)
 def detect_colored_tokens(frame):
     """
     Detect green, yellow, and red circular tokens from the front camera.
 
-    Output format:
-    [
-        {"color": "green", "x": 320, "y": 240, "radius": 25, "area": 1800.0},
-        ...
-    ]
+    Red tokens are pale pink/red because of their gradient.  They need a
+    separate mask made from the original frame.  The red road markings and
+    the player's car are normally much more saturated, so an upper saturation
+    limit is used to reject them.
     """
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    frame_h, frame_w = frame.shape[:2]
 
-    color_ranges = {
-        "green": [
-            ((35, 80, 80), (85, 255, 255))
-        ],
-        "yellow": [
-            ((20, 80, 80), (35, 255, 255))
-        ],
-        "red": [
-            ((0, 80, 80), (10, 255, 255)),
-            ((170, 80, 80), (180, 255, 255))
-        ]
-    }
+    # Gamma correction is useful for distant green and yellow tokens.
+    frame_bright = adjust_gamma(frame, gamma=1.5)
+    hsv_bright = cv2.cvtColor(frame_bright, cv2.COLOR_BGR2HSV)
+
+    # Use the original image for red. Gamma correction reduces the saturation
+    # contrast of the pale red token and can leave only a fragmented contour.
+    hsv_original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     detected_tokens = []
-    kernel = np.ones((5, 5), np.uint8)
+    standard_kernel = np.ones((5, 5), np.uint8)
 
-    for color_name, ranges in color_ranges.items():
+    # -----------------------------------------------------
+    # Green and yellow detection
+    # -----------------------------------------------------
+    standard_color_ranges = {
+        "green": [((50, 30, 150), (70, 255, 255))],
+        "yellow": [((18, 50, 140), (30, 255, 255))]
+    }
+
+    for color_name, ranges in standard_color_ranges.items():
         color_mask = None
 
         for lower, upper in ranges:
-            lower_np = np.array(lower, dtype=np.uint8)
-            upper_np = np.array(upper, dtype=np.uint8)
-            current_mask = cv2.inRange(hsv, lower_np, upper_np)
+            current_mask = cv2.inRange(
+                hsv_bright,
+                np.array(lower, dtype=np.uint8),
+                np.array(upper, dtype=np.uint8)
+            )
+            color_mask = current_mask if color_mask is None else cv2.bitwise_or(color_mask, current_mask)
 
-            if color_mask is None:
-                color_mask = current_mask
-            else:
-                color_mask = cv2.bitwise_or(color_mask, current_mask)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, standard_kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, standard_kernel)
 
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        contours, _ = cv2.findContours(
-            color_mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 100:
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 100 or area > 300000:
                 continue
 
-            perimeter = cv2.arcLength(contour, True)
+            perimeter = cv2.arcLength(cnt, True)
             if perimeter == 0:
                 continue
 
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            # A perfect circle has a circularity of 1.0. A square is ~0.78.
-            # Curbs are long and irregular, so they will have a much lower circularity.
-            if circularity < 0.75:
+            min_circularity = 0.50 if color_name == "green" else 0.75
+            if circularity < min_circularity:
                 continue
 
-            # Ensure the bounding box is somewhat square (since tokens are round)
-            bx, by, bw, bh = cv2.boundingRect(contour)
-            aspect_ratio = float(bw) / bh if bh > 0 else 0.0
-            if aspect_ratio < 0.6 or aspect_ratio > 1.4:
-                continue
-
-            (x, y), radius = cv2.minEnclosingCircle(contour)
-            if radius < 5:
-                continue
-
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
             detected_tokens.append({
                 "color": color_name,
                 "x": int(x),
@@ -302,10 +300,92 @@ def detect_colored_tokens(frame):
                 "area": float(area)
             })
 
+    # -----------------------------------------------------
+    # Red token detection
+    # -----------------------------------------------------
+    # OpenCV hue wraps around: red exists near both 0 and 179.
+    #
+    # The token is a light pink/red gradient. Saturation is deliberately
+    # limited to 20..200 to retain the pale token while rejecting strongly
+    # saturated red road borders and most of the player's red car.
+    red_mask_1 = cv2.inRange(
+        hsv_original,
+        np.array((0, 20, 145), dtype=np.uint8),
+        np.array((20, 200, 255), dtype=np.uint8)
+    )
+    red_mask_2 = cv2.inRange(
+        hsv_original,
+        np.array((160, 20, 145), dtype=np.uint8),
+        np.array((179, 200, 255), dtype=np.uint8)
+    )
+    red_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
+
+    # Close first to reconnect the token's gradient. Use a smaller opening
+    # kernel afterwards so distant tokens are not erased.
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Scale the minimum area so the detector works at different resolutions.
+    red_min_area = max(70.0, frame_w * frame_h * 0.00030)
+    red_max_area = frame_w * frame_h * 0.20
+
+    for cnt in red_contours:
+        area = cv2.contourArea(cnt)
+        if area < red_min_area or area > red_max_area:
+            continue
+
+        x, y, width, height = cv2.boundingRect(cnt)
+        if height == 0:
+            continue
+
+        aspect_ratio = width / float(height)
+        if not (0.58 <= aspect_ratio <= 1.55):
+            continue
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        (center_x, center_y), radius = cv2.minEnclosingCircle(cnt)
+
+        if radius <= 0:
+            continue
+
+        circle_fill_ratio = area / (np.pi * radius * radius)
+
+        # These filters retain round red tokens while rejecting thin road
+        # markings, roadside arrows and irregular red parts of the car.
+        if circularity < 0.46 or circle_fill_ratio < 0.43:
+            continue
+
+        # Ignore HUD text at the top and small fragments near the bottom edge.
+        if center_y < frame_h * 0.20 or center_y > frame_h * 0.92:
+            continue
+
+        detected_tokens.append({
+            "color": "red",
+            "x": int(center_x),
+            "y": int(center_y),
+            "radius": int(radius),
+            "area": float(area)
+        })
+
+    # Optional tuning window. Uncomment temporarily if you need to inspect
+    # which pixels are selected as red:
+    # cv2.imshow("Red Token Mask", cv2.resize(red_mask, (640, 480)))
+    # cv2.waitKey(1)
+
     return detected_tokens
 
 def draw_detected_tokens(frame, tokens):
+    """
+    Draw bounding boxes and semi-transparent overlays for all detected tokens.
+    """
     display_frame = frame.copy()
+    frame_h, frame_w = display_frame.shape[:2]
 
     text_colors = {
         "green": (0, 255, 0),
@@ -313,22 +393,26 @@ def draw_detected_tokens(frame, tokens):
         "red": (0, 0, 255)
     }
 
+    overlay = display_frame.copy()
     for token in tokens:
         color = text_colors.get(token["color"], (255, 255, 255))
         center = (token["x"], token["y"])
         radius = token["radius"]
+        # Semi-transparent filled circle
+        cv2.circle(overlay, center, radius, color, -1)
+        # Bounding box
+        x1 = max(center[0]-radius, 0)
+        y1 = max(center[1]-radius, 0)
+        x2 = min(center[0]+radius, frame_w-1)
+        y2 = min(center[1]+radius, frame_h-1)
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+        # Color label
+        cv2.putText(display_frame, token["color"].upper(), (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        cv2.circle(display_frame, center, radius, color, 2)
-        cv2.putText(
-            display_frame,
-            token["color"],
-            (token["x"] - 20, token["y"] - radius - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2
-        )
-
+    # Blend overlay with original frame
+    alpha = 0.3
+    cv2.addWeighted(overlay, alpha, display_frame, 1-alpha, 0, display_frame)
     return display_frame
 
 
@@ -512,7 +596,7 @@ def processing_task():
 
         debug_frame = draw_detected_tokens(front_frame, tokens)
         debug_frame = cv2.resize(debug_frame, (640, 480))
-        cv2.imshow("Detected Tokens", debug_frame)
+        cv2.imshow("Front Camera", debug_frame)
         cv2.waitKey(1)
 
     # Run trailing / police detection on back camera
@@ -522,6 +606,11 @@ def processing_task():
             shared_data['trailing_detected'] = trailing
             shared_data['police_detected'] = police
             shared_data['danger_detected'] = trailing or False
+            
+            if police:
+                shared_data['run_summary']['police_appeared'] = True
+            if trailing:
+                shared_data['run_summary']['trailing_appeared'] = True
 
         # Show the rear view in the same window, with detection overlays on top.
         try:
@@ -581,132 +670,100 @@ def send_controls_task():
     if control_conn is None:
         return
     
-    # 1. Read the decisions made from shared memory safely
+    # Read shared data
     with data_lock:
-        target_lane = shared_data['target_lane']
-        danger_detected = shared_data['danger_detected']
-        police_detected = shared_data.get('police_detected', False)
-        trailing_detected = shared_data.get('trailing_detected', False)
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
+        target_lane = shared_data['target_lane']
     
-    # Default values
+    # Default control
     steering_input = 0.0
-    acceleration_input = 1.0  # Cruise at full speed forward by default
-    
-    # 2. STATE MACHINE LOGIC
-    # Reaction logic for events detected by vision
-    if police_detected:
-        # Must take next red token: find nearest red token and request its lane
-        red_tokens = [t for t in tokens_snapshot if t.get('color') == 'red']
-        if red_tokens:
-            # pick the red token closest to center x
-            frame_center_x = 320
-            nearest = min(red_tokens, key=lambda t: abs(t['x'] - frame_center_x))
-            desired_lane = lane_from_x(nearest['x'], nearest['y'], frame_width=640)
-            with data_lock:
-                shared_data['target_lane'] = desired_lane
-            target_lane = desired_lane
-            print(f"[EVENT] Police behind: requesting lane {desired_lane} to take red token")
-        else:
-            # No red token visible — slow down to avoid penalty
-            acceleration_input = 0.0
-            print("[EVENT] Police behind: no red token visible, braking")
+    acceleration_input = 1.0  # always move forward
 
-    elif trailing_detected:
-        # Try to move to an adjacent lane away from our current lane
-        evasive_lane = current_lane
-        if current_lane < 2:
-            evasive_lane = current_lane + 1
-        elif current_lane > -2:
-            evasive_lane = current_lane - 1
+    car_x = 320
+    car_y = 480
+    safe_lanes = set([-2, -1, 0, 1, 2])
+    closest_green_lane = None
+    min_distance = float('inf')
 
-        with data_lock:
-            shared_data['target_lane'] = evasive_lane
-        target_lane = evasive_lane
-        with data_lock:
-            shared_data['danger_detected'] = True
-        print(f"[EVENT] Trailing car detected: requesting evasive lane {evasive_lane}")
+    # Identify hazard lanes (yellow/red)
+    for t in tokens_snapshot:
+        if t['y'] > 230:
+            rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
+            abs_lane = max(-2, min(2, current_lane + rel_lane))
+            if t['color'] in ['red', 'yellow']:
+                safe_lanes.discard(abs_lane)
 
-    else:
-        # Standard cruising logic: collect green, avoid red/yellow
-        safe_lanes = set([-2, -1, 0, 1, 2])
-        green_lanes = set()
+    # Find closest green token in a safe lane
+    for t in tokens_snapshot:
+        if t['y'] > 230:
+            rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
+            abs_lane = max(-2, min(2, current_lane + rel_lane))
+            if t['color'] == 'green' and abs_lane in safe_lanes:
+                distance = ((t['x'] - car_x)**2 + (t['y'] - car_y)**2)**0.5
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_green_lane = abs_lane
+
+    # Decide next lane
+    if closest_green_lane is not None:
+        step_direction = 0
+        if closest_green_lane > current_lane:
+            step_direction = 1
+        elif closest_green_lane < current_lane:
+            step_direction = -1
         
-        for t in tokens_snapshot:
-            # Only consider tokens that are somewhat close (e.g. y > 150) so we don't react too early
-            if t['y'] > 150:
-                lane = lane_from_x(t['x'], t['y'], frame_width=640)
-                if t['color'] in ['red', 'yellow']:
-                    safe_lanes.discard(lane)
-                elif t['color'] == 'green':
-                    green_lanes.add(lane)
-                
-        desired_lane = target_lane
-        
-        # If current target is unsafe, or we are in an unsafe lane, we must find a new safe lane
-        if current_lane not in safe_lanes or target_lane not in safe_lanes:
-            if safe_lanes:
-                # Prioritize safe lanes with green tokens
-                safe_green = green_lanes.intersection(safe_lanes)
-                if safe_green:
-                    desired_lane = min(safe_green, key=lambda l: abs(l - current_lane))
-                else:
-                    desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
+        next_lane = current_lane + step_direction
+        # move only if next lane is safe
+        if next_lane in safe_lanes:
+            desired_lane = next_lane
         else:
-            # We are safe. Can we grab a green token?
-            safe_green = green_lanes.intersection(safe_lanes)
-            if safe_green and target_lane not in safe_green:
-                desired_lane = min(safe_green, key=lambda l: abs(l - current_lane))
+            # pick nearest safe lane
+            candidates = [l for l in safe_lanes if l != current_lane]
+            if candidates:
+                desired_lane = min(candidates, key=lambda l: abs(l - current_lane))
+            else:
+                desired_lane = current_lane
 
         if desired_lane != target_lane:
             with data_lock:
                 shared_data['target_lane'] = desired_lane
             target_lane = desired_lane
-            print(f"[CRUISE] Target lane updated to {desired_lane} based on tokens.")
 
+    else:
+        # No green token visible, just stay in current lane or move to safe lane
+        if current_lane not in safe_lanes:
+            if safe_lanes:
+                desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
+                with data_lock:
+                    shared_data['target_lane'] = desired_lane
+                target_lane = desired_lane
+
+    # Lane change state machine (unchanged)
     if steering_state == 0:
-        # STATE 0: IDLE (Wait for a lane change request)
         if target_lane != current_lane:
-            steering_state = 1  # Trigger a tap maneuver!
-            tap_loop_count = 0  # Reset our timer counter
-            print(f"[CONTROL] Lane change requested from {current_lane} to {target_lane}")
-            
+            steering_state = 1
+            tap_loop_count = 0
     elif steering_state == 1:
-        # STATE 1: TAPPING (Actively turning the wheel)
-        if target_lane > current_lane:
-            steering_input = 1.0   # Tap Right
-        else:
-            steering_input = -1.0  # Tap Left
-            
+        steering_input = 1.0 if target_lane > current_lane else -1.0
         tap_loop_count += 1
-        
-        
         if tap_loop_count >= 10:
-            steering_state = 2  # Turn finished, proceed to reset step
-            tap_loop_count = 0  # Reset counter
-            if target_lane > current_lane:
-                current_lane += 1
-            elif target_lane < current_lane:
-                current_lane -= 1
-            
+            steering_state = 2
+            tap_loop_count = 0
+            current_lane += 1 if target_lane > current_lane else -1
     elif steering_state == 2:
-        # STATE 2: RESETTING (Force wheel back to center before doing anything else)
         steering_input = 0.0
         tap_loop_count += 1
-        
-        # Hold the wheel steady for 5 loops to stabilize the car body
         if tap_loop_count >= 5:
-            steering_state = 0  # Done! Return to idle mode
-            print("[CONTROL] Lane change maneuver completed successfully.")
+            steering_state = 0
 
-    # 3. Pack and send the automated floating-point values to the simulator
+    # Send controls
     try:
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
-        control_conn = None
-# ---------------------------------------------------------
+        control_conn = None 
+#---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
 if __name__ == '__main__':
@@ -722,7 +779,7 @@ if __name__ == '__main__':
                     shared_data['target_lane'] = lane
                 time.sleep(4)
 
-    ENABLE_LANE_SWITCH_TEST = True
+    ENABLE_LANE_SWITCH_TEST = False
 
     print("Initializing RTSE Sample Drive...")
 
@@ -779,3 +836,20 @@ if __name__ == '__main__':
     cv2.destroyAllWindows()
     
     print("System terminated cleanly.")
+    
+    # Print run summary
+    print("\n" + "="*45)
+    print(" 🚗  END OF RUN SUMMARY  🚗")
+    print("="*45)
+    with data_lock:
+        summary = shared_data.get('run_summary', {})
+    if summary:
+        print("Tokens Collected (Estimated):")
+        print(f"  🟢 Green:  {summary.get('green_collected', 0)}")
+        print(f"  🟡 Yellow: {summary.get('yellow_collected', 0)}")
+        print(f"  🔴 Red:    {summary.get('red_collected', 0)}")
+        print("-" * 45)
+        print("Events Detected During Run:")
+        print(f"  🚓 Police Car Appeared:   {'YES' if summary.get('police_appeared') else 'NO'}")
+        print(f"  🚘 Trailing Car Appeared: {'YES' if summary.get('trailing_appeared') else 'NO'}")
+    print("="*45 + "\n")
