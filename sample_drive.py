@@ -325,6 +325,9 @@ def detect_colored_tokens(frame):
     return detected_tokens
 
 def draw_detected_tokens(frame, tokens):
+    """
+    Draws bounding boxes for each detected token while keeping the original frame visible.
+    """
     display_frame = frame.copy()
     frame_h, frame_w = display_frame.shape[:2]
 
@@ -334,60 +337,24 @@ def draw_detected_tokens(frame, tokens):
         "red": (0, 0, 255)
     }
 
-    # Bottom center of the screen (car's position)
-    car_center = (int(frame_w / 2), frame_h)
-
     for token in tokens:
         color = text_colors.get(token["color"], (255, 255, 255))
         center = (token["x"], token["y"])
         radius = token["radius"]
 
-        if token["color"] == "green":
-            # Draw bounding box
-            x1 = center[0] - radius
-            y1 = center[1] - radius
-            x2 = center[0] + radius
-            y2 = center[1] + radius
-            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+        # Bounding box
+        x1 = max(center[0] - radius, 0)
+        y1 = max(center[1] - radius, 0)
+        x2 = min(center[0] + radius, frame_w - 1)
+        y2 = min(center[1] + radius, frame_h - 1)
 
-            # Draw "GRN" text above the bounding box
-            cv2.putText(
-                display_frame,
-                "GRN",
-                (x1, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2
-            )
+        # Draw rectangle
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
 
-            # Draw line from car to token center
-            cv2.line(display_frame, car_center, center, color, 2)
-            
-            # Calculate distance and display it on the line
-            distance = ((center[0] - car_center[0])**2 + (center[1] - car_center[1])**2)**0.5
-            mid_point = ((center[0] + car_center[0]) // 2, (center[1] + car_center[1]) // 2)
-            cv2.putText(
-                display_frame,
-                f"Dist: {int(distance)}",
-                mid_point,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 255, 255),
-                2
-            )
-        else:
-            # Original circle style for other tokens
-            cv2.circle(display_frame, center, radius, color, 2)
-            cv2.putText(
-                display_frame,
-                token["color"],
-                (token["x"] - 20, token["y"] - radius - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2
-            )
+        # Draw color name above the rectangle
+        cv2.putText(display_frame, token["color"].upper(),
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     return display_frame
 
