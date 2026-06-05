@@ -258,6 +258,13 @@ def detect_colored_tokens(frame):
     detected_tokens = []
     kernel = np.ones((5, 5), np.uint8)
 
+    road_polygon = np.array([
+        [int(frame_w * 0.08), frame_h - 1],
+        [int(frame_w * 0.30), int(frame_h * 0.42)],
+        [int(frame_w * 0.70), int(frame_h * 0.42)],
+        [int(frame_w * 0.92), frame_h - 1]
+    ], dtype=np.int32)
+
     for color_name, ranges in color_ranges.items():
         # ROI for red only
         if color_name == "red":
@@ -311,6 +318,10 @@ def detect_colored_tokens(frame):
                 continue
             (x, y), radius = cv2.minEnclosingCircle(cnt)
             center = (int(x) + roi_x1, int(y) + roi_y1)
+            if color_name == "red":
+                # Keep red tokens only when they lie on the road surface, not on the roadside signs/grass.
+                if cv2.pointPolygonTest(road_polygon, center, False) < 0:
+                    continue
             detected_tokens.append({
                 "color": color_name,
                 "x": center[0],
