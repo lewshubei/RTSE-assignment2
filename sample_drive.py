@@ -16,6 +16,15 @@ FRONT_CAMERA_PORT = 8080
 BACK_CAMERA_PORT = 8082
 CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
+START_LANE = 0
+START_CENTER_HOLD_SECONDS = 2.0
+CAR_ACCELERATION = 0.78
+MIN_LOOKAHEAD_Y_RATIO = 0.25
+LINE_GROUP_Y_RATIO = 0.08
+LANE_CHANGE_TIME_Y_RATIO = 0.14
+GREEN_LOCK_SECONDS = 1.6
+STEER_TAP_LOOPS = 12
+STEER_RESET_LOOPS = 4
 
 # Shared Resources with Mutex Lock for Concurrency
 shared_data = {
@@ -24,8 +33,9 @@ shared_data = {
     'steering_input' : 0.0,
     'acceleration_input' : 0.0,
     'detected_tokens': [],
-    'target_lane': 0,          # Default: Stay in Center Lane (0)
-    'danger_detected': False   # Default: No trailing car danger
+    'target_lane': START_LANE, # Default: Stay in Center Lane (0)
+    'danger_detected': False,  # Default: No trailing car danger
+    'decision_debug': ''
 }
 
 # Additional shared flags / history for trailing/police detection
@@ -41,7 +51,8 @@ shared_data.update({
         'police_appeared': False,
         'trailing_appeared': False
     },
-    'last_collected_time': 0.0
+    'last_collected_time': 0.0,
+    'last_collected_line_id': None
 })
 data_lock = threading.Lock()
 is_running = True
@@ -430,7 +441,10 @@ def lane_from_x(x, y=None, frame_width=640, frame_height=480):
     vp_y = frame_height * 0.45  # Approximate horizon line
     
     if y <= vp_y:
-        return 0 # Too high up, default to center
+        lane_count = 5
+        lane_width = frame_width / lane_count
+        lane = int(x // lane_width) - 2
+        return max(-2, min(2, lane))
         
     dy = y - vp_y
     dx = x - vp_x
@@ -593,9 +607,13 @@ def processing_task():
 
         with data_lock:
             shared_data['detected_tokens'] = tokens
+            decision_debug = shared_data.get('decision_debug', '')
 
         debug_frame = draw_detected_tokens(front_frame, tokens)
         debug_frame = cv2.resize(debug_frame, (640, 480))
+        if decision_debug:
+            cv2.putText(debug_frame, decision_debug, (10, 460),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         cv2.imshow("Front Camera", debug_frame)
         cv2.waitKey(1)
 
@@ -663,9 +681,14 @@ def processing_task():
 # Global variables to track our steering state machine
 steering_state = 0       # 0 = Idle, 1 = Tapping, 2 = Resetting
 tap_loop_count = 0       # Counts how many loops we hold the steering wheel
-current_lane = 0         # Tracks our car's actual lane position (-2, -1, 0, 1, 2)
+current_lane = START_LANE # Tracks our car's actual lane position (-2, -1, 0, 1, 2)
+last_token_lane = None   # Keeps the last good token decision when tokens briefly disappear
+last_token_time = 0.0
+locked_green_lane = None
+locked_green_until = 0.0
+run_start_time = None
 def send_controls_task():
-    global control_conn, steering_state, tap_loop_count, current_lane
+    global control_conn, steering_state, tap_loop_count, current_lane, last_token_lane, last_token_time, locked_green_lane, locked_green_until, run_start_time
     
     if control_conn is None:
         return
@@ -674,69 +697,134 @@ def send_controls_task():
     with data_lock:
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
         target_lane = shared_data['target_lane']
+        front_frame = shared_data.get('latest_front_frame')
     
     # Default control
     steering_input = 0.0
-    acceleration_input = 1.0  # always move forward
+    acceleration_input = CAR_ACCELERATION  # constant speed from start to end
 
-    car_x = 320
-    car_y = 480
-    safe_lanes = set([-2, -1, 0, 1, 2])
-    closest_green_lane = None
-    min_distance = float('inf')
+    if run_start_time is not None and time.time() - run_start_time < START_CENTER_HOLD_SECONDS:
+        acceleration_input = 0.0
+        current_lane = START_LANE
+        target_lane = START_LANE
+        steering_state = 0
+        tap_loop_count = 0
+        last_token_lane = None
+        locked_green_lane = None
+        locked_green_until = 0.0
+        with data_lock:
+            shared_data['target_lane'] = START_LANE
+        tokens_snapshot = []
 
-    # Identify hazard lanes (yellow/red)
-    for t in tokens_snapshot:
-        if t['y'] > 230:
-            rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
-            abs_lane = max(-2, min(2, current_lane + rel_lane))
-            if t['color'] in ['red', 'yellow']:
-                safe_lanes.discard(abs_lane)
-
-    # Find closest green token in a safe lane
-    for t in tokens_snapshot:
-        if t['y'] > 230:
-            rel_lane = lane_from_x(t['x'], t['y'], frame_width=640)
-            abs_lane = max(-2, min(2, current_lane + rel_lane))
-            if t['color'] == 'green' and abs_lane in safe_lanes:
-                distance = ((t['x'] - car_x)**2 + (t['y'] - car_y)**2)**0.5
-                if distance < min_distance:
-                    min_distance = distance
-                    closest_green_lane = abs_lane
-
-    # Decide next lane
-    if closest_green_lane is not None:
-        step_direction = 0
-        if closest_green_lane > current_lane:
-            step_direction = 1
-        elif closest_green_lane < current_lane:
-            step_direction = -1
-        
-        next_lane = current_lane + step_direction
-        # move only if next lane is safe
-        if next_lane in safe_lanes:
-            desired_lane = next_lane
-        else:
-            # pick nearest safe lane
-            candidates = [l for l in safe_lanes if l != current_lane]
-            if candidates:
-                desired_lane = min(candidates, key=lambda l: abs(l - current_lane))
-            else:
-                desired_lane = current_lane
-
-        if desired_lane != target_lane:
-            with data_lock:
-                shared_data['target_lane'] = desired_lane
-            target_lane = desired_lane
-
+    target_token_lane = None
+    target_token_color = None
+    target_token_y = 0
+    decision_reason = "NO_GREEN"
+    green_candidates = []
+    if front_frame is not None:
+        decision_frame_height, decision_frame_width = front_frame.shape[:2]
     else:
-        # No green token visible, just stay in current lane or move to safe lane
-        if current_lane not in safe_lanes:
-            if safe_lanes:
-                desired_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
+        decision_frame_width, decision_frame_height = 640, 480
+
+    # Only green tokens are allowed to become steering targets.
+    for t in tokens_snapshot:
+        if t.get('color') != 'green':
+            continue
+
+        token_lane = lane_from_x(
+            t['x'],
+            t['y'],
+            frame_width=decision_frame_width,
+            frame_height=decision_frame_height
+        )
+        token_lane = max(-2, min(2, token_lane))
+        y_until_car = max(0.0, decision_frame_height - t['y'])
+        distance_to_car = ((t['x'] - decision_frame_width / 2.0)**2 + y_until_car**2)**0.5
+        green_candidates.append({
+            'lane': token_lane,
+            'color': t['color'],
+            'y': t['y'],
+            'line_id': int(t['y'] // max(1, decision_frame_height * LINE_GROUP_Y_RATIO)),
+            'lane_change': abs(token_lane - current_lane),
+            'distance_to_car': distance_to_car
+        })
+
+    best_token = None
+    if green_candidates:
+        best_token = min(
+            green_candidates,
+            key=lambda token: (
+                -token['y'],
+                token['lane_change'],
+                token['distance_to_car']
+            )
+        )
+        target_token_lane = best_token['lane']
+        target_token_color = best_token['color']
+        target_token_y = best_token['y']
+        locked_green_lane = target_token_lane
+        locked_green_until = time.time() + GREEN_LOCK_SECONDS
+        last_token_lane = target_token_lane
+        last_token_time = time.time()
+        decision_reason = "GREEN"
+
+        now = time.time()
+        car_is_committed_to_lane = target_token_lane == target_lane or target_token_lane == current_lane
+        if target_token_color is not None and target_token_y > decision_frame_height * 0.62 and car_is_committed_to_lane:
+            line_id = best_token['line_id']
+            with data_lock:
+                if shared_data.get('last_collected_line_id') != line_id:
+                    summary_key = f"{target_token_color}_collected"
+                    if summary_key in shared_data['run_summary']:
+                        shared_data['run_summary'][summary_key] += 1
+                        shared_data['last_collected_time'] = now
+                        shared_data['last_collected_line_id'] = line_id
+    elif locked_green_lane is not None and time.time() < locked_green_until:
+        target_token_lane = locked_green_lane
+        decision_reason = "GREEN_LOCK"
+    else:
+        locked_green_lane = None
+        locked_green_until = 0.0
+
+    if target_token_lane is None and last_token_lane is not None:
+        if time.time() - last_token_time < 1.0:
+            target_token_lane = last_token_lane
+            decision_reason = "GREEN_MEMORY"
+
+    if target_token_lane is None:
+        target_lane = current_lane
+        if steering_state == 1:
+            steering_state = 0
+            tap_loop_count = 0
+        with data_lock:
+            shared_data['target_lane'] = current_lane
+        decision_reason = "NO_GREEN_HOLD"
+
+    # Decide next lane only when the previous lane change has finished.
+    if steering_state == 0:
+        if target_token_lane is not None:
+            step_direction = 0
+            if target_token_lane > current_lane:
+                step_direction = 1
+            elif target_token_lane < current_lane:
+                step_direction = -1
+            
+            desired_lane = current_lane + step_direction
+
+            if desired_lane != target_lane:
                 with data_lock:
                     shared_data['target_lane'] = desired_lane
                 target_lane = desired_lane
+
+        else:
+            target_lane = current_lane
+            with data_lock:
+                shared_data['target_lane'] = current_lane
+
+    with data_lock:
+        shared_data['decision_debug'] = (
+            f"{decision_reason} greens={len(green_candidates)} cur={current_lane} tgt={target_lane} green={target_token_lane}"
+        )
 
     # Lane change state machine (unchanged)
     if steering_state == 0:
@@ -744,16 +832,22 @@ def send_controls_task():
             steering_state = 1
             tap_loop_count = 0
     elif steering_state == 1:
-        steering_input = 1.0 if target_lane > current_lane else -1.0
-        tap_loop_count += 1
-        if tap_loop_count >= 10:
-            steering_state = 2
+        if target_lane == current_lane:
+            steering_state = 0
             tap_loop_count = 0
-            current_lane += 1 if target_lane > current_lane else -1
+            steering_input = 0.0
+        else:
+            steering_input = 1.0 if target_lane > current_lane else -1.0
+            tap_loop_count += 1
+            if tap_loop_count >= STEER_TAP_LOOPS:
+                steering_state = 2
+                tap_loop_count = 0
+                current_lane += 1 if target_lane > current_lane else -1
+                current_lane = max(-2, min(2, current_lane))
     elif steering_state == 2:
         steering_input = 0.0
         tap_loop_count += 1
-        if tap_loop_count >= 5:
+        if tap_loop_count >= STEER_RESET_LOOPS:
             steering_state = 0
 
     # Send controls
@@ -767,6 +861,17 @@ def send_controls_task():
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
 if __name__ == '__main__':
+    current_lane = START_LANE
+    steering_state = 0
+    tap_loop_count = 0
+    last_token_lane = None
+    last_token_time = 0.0
+    locked_green_lane = None
+    locked_green_until = 0.0
+    run_start_time = time.time()
+    with data_lock:
+        shared_data['target_lane'] = START_LANE
+
     # 1. Define the tester function properly
     def mock_team_a_tester():
         print("[TESTER] Mock Team A thread started.")
