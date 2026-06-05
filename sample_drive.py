@@ -248,8 +248,10 @@ def detect_colored_tokens(frame):
         "green": [((50, 30, 150), (70, 255, 255))],
         "yellow": [((18, 50, 140), (30, 255, 255))],
         "red": [
-            ((0, 150, 200), (10, 255, 255)),
-            ((170, 150, 200), (180, 255, 255))
+            # Red tokens in this scene are bright but often slightly pink after gamma correction.
+            # Widen the hue and saturation/value ranges so the detector keeps them.
+            ((0, 90, 120), (15, 255, 255)),
+            ((165, 90, 120), (180, 255, 255))
         ]
     }
 
@@ -259,10 +261,10 @@ def detect_colored_tokens(frame):
     for color_name, ranges in color_ranges.items():
         # ROI for red only
         if color_name == "red":
-            roi_x1 = int(frame_w * 0.05)
-            roi_x2 = int(frame_w * 0.95)
+            roi_x1 = int(frame_w * 0.02)
+            roi_x2 = int(frame_w * 0.98)
             roi_y1 = 0
-            roi_y2 = int(frame_h * 0.7)
+            roi_y2 = int(frame_h * 0.92)
             roi = hsv[roi_y1:roi_y2, roi_x1:roi_x2]
         else:
             roi_x1, roi_y1 = 0, 0
@@ -288,19 +290,27 @@ def detect_colored_tokens(frame):
         contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 100 or area > 5000:
+            if area < 100:
+                continue
+            if color_name == "red":
+                if area > 30000:
+                    continue
+            elif area > 5000:
                 continue
             perimeter = cv2.arcLength(cnt, True)
             if perimeter == 0:
                 continue
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            min_circularity = 0.5 if color_name == "green" else 0.75
+            if color_name == "green":
+                min_circularity = 0.5
+            elif color_name == "red":
+                min_circularity = 0.6
+            else:
+                min_circularity = 0.75
             if circularity < min_circularity:
                 continue
             (x, y), radius = cv2.minEnclosingCircle(cnt)
             center = (int(x) + roi_x1, int(y) + roi_y1)
-            if color_name == "red" and center[1] > roi_y2:
-                continue
             detected_tokens.append({
                 "color": color_name,
                 "x": center[0],
