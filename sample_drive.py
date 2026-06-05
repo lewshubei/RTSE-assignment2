@@ -210,11 +210,12 @@ def processing_task():
 
     # Define HSV ranges for green, yellow, red
     color_ranges = {
-        'green': ((40, 50, 50), (80, 255, 255)),
-        'yellow': ((20, 100, 100), (30, 255, 255)),
-        'red1': ((0, 100, 100), (10, 255, 255)),
-        'red2': ((160, 100, 100), (179, 255, 255))
-    }
+    'green': ((50, 150, 150), (90, 255, 255)),      # bright green
+    'yellow': ((20, 150, 150), (35, 255, 255)),     # golden yellow
+    'red1': ((0, 150, 150), (10, 255, 255)),        # red lower hue
+    'red2': ((160, 150, 150), (179, 255, 255)),     # red upper hue
+              # gray/silver
+}
 
     # Initialize mask
     mask_total = None
