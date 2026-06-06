@@ -697,38 +697,38 @@ def send_controls_task():
     if control_conn is None:
         return
 
-    # Default controls
-    steering_input = 0.0
+    # Default forward speed
     acceleration_input = CAR_ACCELERATION
+    steering_input = 0.0
 
-    # Read the target lane set by processing_task()
+    # Read decision from processing_task
     with data_lock:
         target_lane = shared_data.get('target_lane', current_lane)
 
-    # Compute the difference between current lane and target lane
+    # Compute lane difference
     lane_diff = target_lane - current_lane
 
     if lane_diff != 0:
-        # Steering proportional to lane difference
+        # Determine steering direction
         steering_input = max(-1.0, min(1.0, lane_diff * GREEN_STEER_GAIN))
-        # Apply minimum steering threshold for noticeable movement
         if abs(steering_input) < GREEN_MIN_STEER:
             steering_input = GREEN_MIN_STEER if steering_input > 0 else -GREEN_MIN_STEER
-        # Gradually update current lane
+
+        # Move current lane gradually toward target
         current_lane += 1 if lane_diff > 0 else -1
         current_lane = max(-2, min(2, current_lane))
 
-    # Send steering and acceleration commands to the vehicle
+    # Update shared_data for monitoring/debugging
+    with data_lock:
+        shared_data['decision_debug'] = f"cur={current_lane} tgt={target_lane} steering={steering_input:.2f}"
+
+    # Send controls to vehicle
     try:
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
         control_conn = None
-
-    # Update debug info
-    with data_lock:
-        shared_data['decision_debug'] = f"cur={current_lane} tgt={target_lane} steering={steering_input:.2f}"
 #---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
