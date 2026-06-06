@@ -931,36 +931,15 @@ if __name__ == '__main__':
     with data_lock:
         shared_data['target_lane'] = START_LANE
 
-    # 1. Define the tester function properly
-    def mock_team_a_tester():
-        print("[TESTER] Mock Team A thread started.")
-        time.sleep(5) # Wait for the simulator to fully launch and connect
-        
-        while is_running:
-            for lane in [2, 1, 0, -1, -2, 0]:
-                print(f"\n--- [TEST] Simulating: Move to lane {lane} ---")
-                with data_lock:
-                    shared_data['target_lane'] = lane
-                time.sleep(4)
-
-    ENABLE_LANE_SWITCH_TEST = False
-
     print("Initializing RTSE Sample Drive...")
 
-# To start this tester thread, add this line inside your `__main__` section:
-# threading.Thread(target=mock_team_a_tester, daemon=True).start()
-    print("Initializing RTSE Sample Drive...")
-    
     # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
     
     print("\n--- Starting Real-Time Tasks (awaiting connections dynamically) ---\n")
     
-    # This is where you define tasks with explicit Scheduling parameters (Concurrency, Priority, Period)
-    # Period refers to the period of execution of the task in seconds
-    # Priority refers to the priority of the task, higher priority means higher priority
-    # Concurrency refers to the number of instances of the task that can run at the same time
+    # Define and start real-time tasks
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
@@ -972,25 +951,19 @@ if __name__ == '__main__':
     t_processing.start()
     t_controls.start()
 
-    if ENABLE_LANE_SWITCH_TEST:
-        threading.Thread(target=mock_team_a_tester, daemon=True).start()
-        print("[TEST] Lane switch test mode enabled. Watch for control state-machine messages.")
-    
     try:
-        # You need this to keep the main thread alive, otherwise the program will exit immediately
         while is_running:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
 
-    # This is to make sure that the tasks are terminated cleanly
+    # Clean shutdown
     t_front_camera.join()
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
     
-    # This is to close all the connections
     if front_camera_sock:
         front_camera_sock.close()
     if back_camera_sock:
@@ -1000,7 +973,7 @@ if __name__ == '__main__':
     cv2.destroyAllWindows()
     
     print("System terminated cleanly.")
-    
+
     # Print run summary
     print("\n" + "="*45)
     print(" 🚗  END OF RUN SUMMARY  🚗")
