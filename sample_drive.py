@@ -692,118 +692,43 @@ run_start_time = None
 steering_history = collections.deque(maxlen=5)  # Last 5 frames
 
 def send_controls_task():
-    global control_conn, current_lane, last_token_lane, last_token_time
-    global locked_green_lane, locked_green_until, run_start_time, steering_history
+    global control_conn, current_lane
 
     if control_conn is None:
         return
 
-    with data_lock:
-        tokens_snapshot = list(shared_data.get('detected_tokens', []))
-        front_frame = shared_data.get('latest_front_frame')
-
+    # Default controls
     steering_input = 0.0
     acceleration_input = CAR_ACCELERATION
 
-    # Initial hold at center lane
-    if run_start_time is not None and time.time() - run_start_time < START_CENTER_HOLD_SECONDS:
-        acceleration_input = 0.0
-        with data_lock:
-            shared_data['target_lane'] = START_LANE
-        return
-
-    frame_h, frame_w = (480, 640)
-    if front_frame is not None:
-        frame_h, frame_w = front_frame.shape[:2]
-
-    target_lane = current_lane
-    decision_reason = "NO_GREEN"
-    green_candidates = []
-    bad_lanes = set()
-
-    # Process all tokens
-    for t in tokens_snapshot:
-        lane = lane_from_x(t['x'], t['y'], frame_width=frame_w, frame_height=frame_h)
-        color = t.get('color')
-
-        # Red/Yellow token: mark bad lane
-        if color in ['red', 'yellow'] and t['y'] > frame_h * 0.25:  # increase lookahead
-            bad_lanes.add(lane)
-
-        # Green tokens for collection
-        if color == 'green':
-            y_until_car = max(0.0, frame_h - t['y'])
-            reachable_lane_changes = 1 + int(y_until_car / max(1.0, frame_h * LANE_CHANGE_TIME_Y_RATIO))
-            distance_to_car = ((t['x'] - frame_w / 2.0)**2 + y_until_car**2)**0.5
-            green_candidates.append({
-                'lane': lane,
-                'x': t['x'],
-                'y': t['y'],
-                'is_reachable': abs(lane - current_lane) <= reachable_lane_changes,
-                'distance_to_car': distance_to_car
-            })
-
-    # --- Decide target lane ---
-    best_token = None
-    if green_candidates:
-        best_token = min(
-            green_candidates,
-            key=lambda t: (not t['is_reachable'], t['distance_to_car'])
-        )
-        if best_token['is_reachable']:
-            target_lane = best_token['lane']
-            decision_reason = "GREEN_ANTICIPATE"
-            locked_green_lane = target_lane
-            locked_green_until = time.time() + GREEN_LOCK_SECONDS
-            last_token_lane = target_lane
-            last_token_time = time.time()
-    else:
-        # Avoid red/yellow tokens
-        if current_lane in bad_lanes:
-            safe_lanes = [l for l in [-2, -1, 0, 1, 2] if l not in bad_lanes]
-            if safe_lanes:
-                target_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
-                decision_reason = "AVOID_BAD"
-            else:
-                # No safe lane: slow down
-                acceleration_input = GREEN_CHASE_ACCELERATION * 0.5
-                decision_reason = "NO_SAFE_LANE"
-
-    # --- Incremental steering toward target lane ---
-    lane_diff = target_lane - current_lane
-    if lane_diff != 0:
-        desired_steering = max(-1.0, min(1.0, lane_diff * GREEN_STEER_GAIN))
-        if abs(desired_steering) < GREEN_MIN_STEER:
-            desired_steering = GREEN_MIN_STEER if desired_steering > 0 else -GREEN_MIN_STEER
-
-        # Steering smoothing
-        steering_history.append(desired_steering)
-        steering_input = sum(steering_history) / len(steering_history)
-
-        # Update current lane gradually
-        if abs(lane_diff) > 0.1:  # threshold for update
-            current_lane += 1 if lane_diff > 0 else -1
-            current_lane = max(-2, min(2, current_lane))
-
-    # Limit acceleration if chasing green token
-    if best_token:
-        acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
-
-    # Update shared data
+    # Read the target lane set by processing_task()
     with data_lock:
-        shared_data['target_lane'] = target_lane
-        shared_data['decision_debug'] = (
-            f"{decision_reason} cur={current_lane} tgt={target_lane} "
-            f"bad={bad_lanes} steering={steering_input:.2f}"
-        )
+        target_lane = shared_data.get('target_lane', current_lane)
 
-    # Send control signals
+    # Compute the difference between current lane and target lane
+    lane_diff = target_lane - current_lane
+
+    if lane_diff != 0:
+        # Steering proportional to lane difference
+        steering_input = max(-1.0, min(1.0, lane_diff * GREEN_STEER_GAIN))
+        # Apply minimum steering threshold for noticeable movement
+        if abs(steering_input) < GREEN_MIN_STEER:
+            steering_input = GREEN_MIN_STEER if steering_input > 0 else -GREEN_MIN_STEER
+        # Gradually update current lane
+        current_lane += 1 if lane_diff > 0 else -1
+        current_lane = max(-2, min(2, current_lane))
+
+    # Send steering and acceleration commands to the vehicle
     try:
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
         control_conn = None
+
+    # Update debug info
+    with data_lock:
+        shared_data['decision_debug'] = f"cur={current_lane} tgt={target_lane} steering={steering_input:.2f}"
 #---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
