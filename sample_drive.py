@@ -698,16 +698,17 @@ def send_controls_task():
     with data_lock:
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
         front_frame = shared_data.get('latest_front_frame')
-        police_active = shared_data.get('police_detected', False)
-        trailing_danger = shared_data.get('trailing_detected', False)
     
-    # Base physics properties
+    # Base control configurations
     steering_input = 0.0
     acceleration_input = CAR_ACCELERATION 
 
-    # 1. Handle Initialization Delays
+    # Warm-up/Start hold period to stabilize execution at 0.0 seconds
     if run_start_time is not None and time.time() - run_start_time < START_CENTER_HOLD_SECONDS:
-        control_conn.sendall(struct.pack('ff', 0.0, 0.0))
+        try:
+            control_conn.sendall(struct.pack('ff', 0.0, 0.0))
+        except Exception:
+            pass
         current_lane = START_LANE
         return
 
@@ -716,86 +717,78 @@ def send_controls_task():
     else:
         img_w, img_h = 640, 480
 
-    # 2. Extract Token Targets and Identify Hazard Lanes
-    bad_lanes = set()
+    # 1. Classify Token Objects by Lane
     green_targets = []
-    police_red_targets = []
+    immediate_hazards = set()
 
     for t in tokens_snapshot:
         t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
         t_lane = max(-2, min(2, t_lane))
         color = t.get('color')
 
-        # Treat yellow and red as structural hazards if they are within catching range
-        if color in ['red', 'yellow'] and t['y'] > (img_h * 0.30):
-            bad_lanes.add(t_lane)
-
         if color == 'green':
-            green_targets.append({'lane': t_lane, 'y': t['y']})
-        elif color == 'red' and police_active:
-            police_red_targets.append({'lane': t_lane, 'y': t['y']})
+            # Store lane, vertical pixel position, and distance from center track
+            green_targets.append({
+                'lane': t_lane, 
+                'y': t['y'], 
+                'dist_from_center': abs(t['x'] - (img_w / 2.0))
+            })
+        elif color in ['red', 'yellow']:
+            # Only count as a hazard if it's in the lower half of the screen (imminent danger)
+            if t['y'] > (img_h * 0.55):
+                immediate_hazards.add(t_lane)
 
-    # 3. Dynamic Strategy Evaluation (Determine Ultimate Target Lane)
+    # 2. Select Ultimate Target Lane
     chosen_target_lane = None
     decision_reason = "MAINTAIN"
 
-    # Emergency Event A: Police wants us to intercept a red token
-    if police_active and police_red_targets:
-        best_red = max(police_red_targets, key=lambda item: item['y']) # Target closest red
-        chosen_target_lane = best_red['lane']
-        decision_reason = "POLICE_RED_INTERCEPT"
-
-    # Emergency Event B: Trailing vehicle behind us requires immediate evasive actions
-    elif trailing_danger:
-        # Find any adjacent lane that doesn't have a red/yellow hazard token
-        safe_lanes = [l for l in [-2, -1, 0, 1, 2] if l not in bad_lanes and l != current_lane]
-        if safe_lanes:
-            chosen_target_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
-            decision_reason = "EVADE_TRAILING"
-
-    # Standard Operation: Target the closest/lowest valid Green Token
-    elif green_targets:
-        # Filter green tokens that aren't blocked by a red/yellow right in front of them
-        valid_greens = [g for g in green_targets if g['lane'] not in bad_lanes]
-        targets_to_use = valid_greens if valid_greens else green_targets
+    if green_targets:
+        # STRATEGY: Prioritize green tokens that give us time to react.
+        # We sort primarily by green tokens further up the screen (smaller Y coordinates) 
+        # so the tap state machine can complete execution before arrival.
         
-        if targets_to_use:
-            # Prioritize tokens closest to the vehicle (highest Y value)
-            best_green = max(targets_to_use, key=lambda item: item['y'])
+        # Filter out greens blocked by immediate hazards if possible, but keep them if no others exist
+        preferred_greens = [g for g in green_targets if g['lane'] not in immediate_hazards]
+        candidates = preferred_greens if preferred_greens else green_targets
+        
+        if candidates:
+            # Sort by furthest away (smallest y) to react early, then closest lane change
+            best_green = min(candidates, key=lambda item: (item['y'], abs(item['lane'] - current_lane)))
             chosen_target_lane = best_green['lane']
-            decision_reason = "COLLECT_GREEN"
+            decision_reason = "TARGET_GREEN_FAR"
             
-            # Update memory state
+            # Save to memory in case of frame dropouts
             last_token_lane = chosen_target_lane
             last_token_time = time.time()
 
-    # Memory Fallback: Maintain heading if green token momentarily drops from frame
+    # Memory Fallback: If green tokens disappear briefly, don't abort the lane change!
     if chosen_target_lane is None and last_token_lane is not None:
-        if time.time() - last_token_time < 0.8:  # Cache for 800ms max
+        if time.time() - last_token_time < 0.6:  # Maintain target for up to 600ms
             chosen_target_lane = last_token_lane
-            decision_reason = "GREEN_MEMORY"
+            decision_reason = "GREEN_LANE_MEMORY"
 
-    # Avoidance Fallback: If current lane turns hazardous, step away
-    if chosen_target_lane is None and current_lane in bad_lanes:
-        escapes = [l for l in [-2, -1, 0, 1, 2] if l not in bad_lanes]
+    # Avoidance Fallback: No green targets visible, but our current lane has a penalty token close by
+    if chosen_target_lane is None and current_lane in immediate_hazards:
+        # Move to the closest available lane that does not have an immediate hazard
+        escapes = [l for l in [-2, -1, 0, 1, 2] if l not in immediate_hazards]
         if escapes:
             chosen_target_lane = min(escapes, key=lambda l: abs(l - current_lane))
-            decision_reason = "LEAVE_HAZARD_LANE"
+            decision_reason = "AVOID_PENALTY"
 
-    # Baseline: Default to staying stable in current lane
+    # Default Baseline: If track is clear and no greens are found, maintain current heading
     if chosen_target_lane is None:
         chosen_target_lane = current_lane
 
-    # 4. Execute Movement through Finite State Machine (No blending!)
-    if steering_state == 0:  # IDLE
+    # 3. Process Discrete State Machine Output (Do not blend with Proportional logic)
+    if steering_state == 0:  # IDLE STATE
         if chosen_target_lane != current_lane:
             steering_state = 1
             tap_loop_count = 0
-            # Set target lane stepping strictly 1 lane at a time
+            # Step strictly 1 lane at a time to prevent overshoot
             with data_lock:
                 shared_data['target_lane'] = current_lane + (1 if chosen_target_lane > current_lane else -1)
 
-    elif steering_state == 1:  # ACTIVE LANE CHANGING TAPS
+    elif steering_state == 1:  # ACTIVE TAP STATE
         with data_lock:
             tgt_lane = shared_data['target_lane']
 
@@ -804,29 +797,30 @@ def send_controls_task():
             steering_input = 0.0
         else:
             steering_input = 1.0 if tgt_lane > current_lane else -1.0
-            acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)  # Stabilize velocity while turning
+            # Slightly scale back throttle to improve lateral traction stability while turning 
+            acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)  
             tap_loop_count += 1
             if tap_loop_count >= STEER_TAP_LOOPS:
                 steering_state = 2
                 tap_loop_count = 0
                 current_lane = max(-2, min(2, current_lane + (1 if tgt_lane > current_lane else -1)))
 
-    elif steering_state == 2:  # STEERING RESET DEAD-TIME
+    elif steering_state == 2:  # TIMED RESET RESET STATE
         steering_input = 0.0
         tap_loop_count += 1
         if tap_loop_count >= STEER_RESET_LOOPS:
             steering_state = 0
 
-    # Log operational telemetry for engineering diagnostics
+    # Log telemetry to console for debugging
     with data_lock:
-        shared_data['decision_debug'] = f"State: {decision_reason} | Current: {current_lane} | Goal: {chosen_target_lane} | Output Steer: {steering_input}"
+        shared_data['decision_debug'] = f"Reason: {decision_reason} | Lane: {current_lane} -> GoTo: {chosen_target_lane} | Out Steer: {steering_input}"
 
-    # 5. Transmission
+    # 4. Transmit Frame Payload
     try:
         data = struct.pack('ff', float(steering_input), float(acceleration_input))
         control_conn.sendall(data)
     except Exception as e:
-        print(f"Control link dropped: {e}")
+        print(f"Control packet transmission error: {e}")
         control_conn = None
 #---------------------------------------------------------
 # Main (Scheduler Initialization)
