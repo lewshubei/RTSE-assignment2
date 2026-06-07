@@ -689,35 +689,52 @@ locked_green_lane = None
 locked_green_until = 0.0
 run_start_time = None
 def send_controls_task():
-    global control_conn, steering_state, tap_loop_count, current_lane, last_token_lane, last_token_time, locked_green_lane, locked_green_until, run_start_time
+    global control_conn, steering_state, tap_loop_count, current_lane, last_token_lane, last_token_time, run_start_time
     
     if control_conn is None:
         return
     
-    # Read shared data snapshots
     with data_lock:
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
         front_frame = shared_data.get('latest_front_frame')
-    
-    # Base control configurations
+        # Use your summary tracker to estimate how fast we are going!
+        run_summary = shared_data.get('run_summary', {})
+        green_streak = run_summary.get('green_collected', 0)
+        red_streak = run_summary.get('red_collected', 0)
+
     steering_input = 0.0
+    # Base acceleration baseline
     acceleration_input = CAR_ACCELERATION 
 
-    # Warm-up/Start hold period to stabilize execution at 0.0 seconds
     if run_start_time is not None and time.time() - run_start_time < START_CENTER_HOLD_SECONDS:
-        try:
-            control_conn.sendall(struct.pack('ff', 0.0, 0.0))
-        except Exception:
-            pass
+        try: control_conn.sendall(struct.pack('ff', 0.0, 0.0))
+        except Exception: pass
         current_lane = START_LANE
         return
 
-    if front_frame is not None:
-        img_h, img_w = front_frame.shape[:2]
-    else:
-        img_w, img_h = 640, 480
+    img_w, img_h = (front_frame.shape[1], front_frame.shape[0]) if front_frame is not None else (640, 480)
 
-    # 1. Classify Token Objects by Lane
+    # =========================================================
+    # 1. DYNAMIC SPEED ESTIMATION & PARAMETER SCALING
+    # =========================================================
+    # Estimate speed multiplier based on game rules (+10% per green, -20% per red)
+    estimated_speed_modifier = 1.0 + (green_streak * 0.10) - (red_streak * 0.20)
+    estimated_speed_modifier = max(0.5, min(2.5, estimated_speed_modifier)) # Bound it safely
+
+    # ADAPTIVE FORMULA: The faster we go, the fewer loops we hold the tap, 
+    # because the car covers lateral ground faster and we need sharper, quicker reactions!
+    # Base STEER_TAP_LOOPS is 12. At 2x speed, it reduces to ~7-8 loops.
+    adaptive_tap_loops = max(6, int(STEER_TAP_LOOPS / (estimated_speed_modifier ** 0.5)))
+    adaptive_reset_loops = max(2, int(STEER_RESET_LOOPS / (estimated_speed_modifier ** 0.5)))
+
+    # ADAPTIVE HORIZON: The faster we go, the higher up the screen a token MUST be 
+    # for us to realistically catch it. If it's below this Y-ratio, ignore it!
+    # At base speed, deadline is at 55% down the screen. At high speed, deadline moves up to 35%.
+    danger_y_deadline = img_h * (0.55 - min(0.20, (estimated_speed_modifier - 1.0) * 0.15))
+
+    # =========================================================
+    # 2. TOKEN PROCESSING WITH ADAPTIVE FILTERING
+    # =========================================================
     green_targets = []
     immediate_hazards = set()
 
@@ -727,68 +744,56 @@ def send_controls_task():
         color = t.get('color')
 
         if color == 'green':
-            # Store lane, vertical pixel position, and distance from center track
-            green_targets.append({
-                'lane': t_lane, 
-                'y': t['y'], 
-                'dist_from_center': abs(t['x'] - (img_w / 2.0))
-            })
+            # ONLY target green tokens that are above our speed-adjusted deadline!
+            if t['y'] < danger_y_deadline:
+                green_targets.append({'lane': t_lane, 'y': t['y']})
         elif color in ['red', 'yellow']:
-            # Only count as a hazard if it's in the lower half of the screen (imminent danger)
-            if t['y'] > (img_h * 0.55):
+            if t['y'] > danger_y_deadline:
                 immediate_hazards.add(t_lane)
 
-    # 2. Select Ultimate Target Lane
+    # =========================================================
+    # 3. DECISION PIECE
+    # =========================================================
     chosen_target_lane = None
     decision_reason = "MAINTAIN"
 
     if green_targets:
-        # STRATEGY: Prioritize green tokens that give us time to react.
-        # We sort primarily by green tokens further up the screen (smaller Y coordinates) 
-        # so the tap state machine can complete execution before arrival.
-        
-        # Filter out greens blocked by immediate hazards if possible, but keep them if no others exist
+        # Target the furthest away visible green token to give us maximal reaction time
         preferred_greens = [g for g in green_targets if g['lane'] not in immediate_hazards]
         candidates = preferred_greens if preferred_greens else green_targets
         
         if candidates:
-            # Sort by furthest away (smallest y) to react early, then closest lane change
-            best_green = min(candidates, key=lambda item: (item['y'], abs(item['lane'] - current_lane)))
+            best_green = min(candidates, key=lambda item: item['y'])
             chosen_target_lane = best_green['lane']
-            decision_reason = "TARGET_GREEN_FAR"
-            
-            # Save to memory in case of frame dropouts
+            decision_reason = "SPEED_ADAPTIVE_GREEN"
             last_token_lane = chosen_target_lane
             last_token_time = time.time()
 
-    # Memory Fallback: If green tokens disappear briefly, don't abort the lane change!
     if chosen_target_lane is None and last_token_lane is not None:
-        if time.time() - last_token_time < 0.6:  # Maintain target for up to 600ms
+        if time.time() - last_token_time < 0.5:
             chosen_target_lane = last_token_lane
             decision_reason = "GREEN_LANE_MEMORY"
 
-    # Avoidance Fallback: No green targets visible, but our current lane has a penalty token close by
     if chosen_target_lane is None and current_lane in immediate_hazards:
-        # Move to the closest available lane that does not have an immediate hazard
         escapes = [l for l in [-2, -1, 0, 1, 2] if l not in immediate_hazards]
         if escapes:
             chosen_target_lane = min(escapes, key=lambda l: abs(l - current_lane))
             decision_reason = "AVOID_PENALTY"
 
-    # Default Baseline: If track is clear and no greens are found, maintain current heading
     if chosen_target_lane is None:
         chosen_target_lane = current_lane
 
-    # 3. Process Discrete State Machine Output (Do not blend with Proportional logic)
-    if steering_state == 0:  # IDLE STATE
+    # =========================================================
+    # 4. ADAPTIVE STATE MACHINE EXECUTION
+    # =========================================================
+    if steering_state == 0:
         if chosen_target_lane != current_lane:
             steering_state = 1
             tap_loop_count = 0
-            # Step strictly 1 lane at a time to prevent overshoot
             with data_lock:
                 shared_data['target_lane'] = current_lane + (1 if chosen_target_lane > current_lane else -1)
 
-    elif steering_state == 1:  # ACTIVE TAP STATE
+    elif steering_state == 1:
         with data_lock:
             tgt_lane = shared_data['target_lane']
 
@@ -797,30 +802,33 @@ def send_controls_task():
             steering_input = 0.0
         else:
             steering_input = 1.0 if tgt_lane > current_lane else -1.0
-            # Slightly scale back throttle to improve lateral traction stability while turning 
-            acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)  
+            
+            # CRITICAL CONTROL TWEAK: When going fast, drop throttle down significantly 
+            # DURING the lane change to stabilize traction and allow the nose to swing over quickly!
+            acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION - 0.05)  
+            
             tap_loop_count += 1
-            if tap_loop_count >= STEER_TAP_LOOPS:
+            # Use our dynamic loop ceiling instead of a hardcoded constant!
+            if tap_loop_count >= adaptive_tap_loops:
                 steering_state = 2
                 tap_loop_count = 0
                 current_lane = max(-2, min(2, current_lane + (1 if tgt_lane > current_lane else -1)))
 
-    elif steering_state == 2:  # TIMED RESET RESET STATE
+    elif steering_state == 2:
         steering_input = 0.0
         tap_loop_count += 1
-        if tap_loop_count >= STEER_RESET_LOOPS:
+        # Use dynamic reset loop count
+        if tap_loop_count >= adaptive_reset_loops:
             steering_state = 0
 
-    # Log telemetry to console for debugging
     with data_lock:
-        shared_data['decision_debug'] = f"Reason: {decision_reason} | Lane: {current_lane} -> GoTo: {chosen_target_lane} | Out Steer: {steering_input}"
+        shared_data['decision_debug'] = f"V-Mod: {estimated_speed_modifier:.2f} | Tap Limit: {adaptive_tap_loops} | GoTo: {chosen_target_lane}"
 
-    # 4. Transmit Frame Payload
     try:
         data = struct.pack('ff', float(steering_input), float(acceleration_input))
         control_conn.sendall(data)
     except Exception as e:
-        print(f"Control packet transmission error: {e}")
+        print(f"Control error: {e}")
         control_conn = None
 #---------------------------------------------------------
 # Main (Scheduler Initialization)
