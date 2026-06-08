@@ -29,6 +29,9 @@ LANE_CHANGE_TIME_Y_RATIO = 0.14
 GREEN_LOCK_SECONDS = 1.6
 STEER_TAP_LOOPS = 12
 STEER_RESET_LOOPS = 4
+TOKEN_DECISION_Y_MIN = 120
+LANE_CHANGE_TAP_LOOPS = 35
+LANE_CHANGE_RESET_LOOPS = 8
 
 # Shared Resources with Mutex Lock for Concurrency
 shared_data = {
@@ -718,69 +721,59 @@ def send_controls_task():
     estimated_speed_modifier = 1.0 + (green_streak * 0.10) - (red_streak * 0.20)
     estimated_speed_modifier = max(0.5, min(2.5, estimated_speed_modifier))
 
-    # Calculate adaptive state machine loops based on velocity
-    adaptive_tap_loops = max(6, int(STEER_TAP_LOOPS / (estimated_speed_modifier ** 0.5)))
-    adaptive_reset_loops = max(2, int(STEER_RESET_LOOPS / (estimated_speed_modifier ** 0.5)))
-
-    # Green catchability deadline: If a green token is closer than this, ignore it.
-    green_y_deadline = img_h * (0.60 - min(0.20, (estimated_speed_modifier - 1.0) * 0.15))
+    # Calculate adaptive state machine loops based on velocity.
+    adaptive_tap_loops = max(12, int(LANE_CHANGE_TAP_LOOPS / (estimated_speed_modifier ** 0.35)))
+    adaptive_reset_loops = max(4, int(LANE_CHANGE_RESET_LOOPS / (estimated_speed_modifier ** 0.35)))
 
     # =========================================================
-    # 2. STRICT PAYLOAD CLASSIFICATION (FIXED LOGIC)
+    # 2. TOKEN PRIORITY CLASSIFICATION
     # =========================================================
-    green_targets = []
-    completely_blocked_lanes = set()
+    token_priority = {'green': 3, 'yellow': 2, 'red': 1}
+    best_token = None
 
     for t in tokens_snapshot:
         t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
         t_lane = max(-2, min(2, t_lane))
         color = t.get('color')
 
-        # FIX 1: Absolutely look up the entire track horizon for hazards. 
-        # If there is a red/yellow anywhere in a lane, mark it as blocked.
-        if color in ['red', 'yellow']:
-            if t['y'] > (img_h * 0.25): # Ignore only background noise above horizon
-                completely_blocked_lanes.add(t_lane)
+        if color not in token_priority:
+            continue
 
-        elif color == 'green':
-            # FIX 2: Only collect greens that are far away enough to catch safely
-            if t['y'] < green_y_deadline:
-                green_targets.append({'lane': t_lane, 'y': t['y']})
+        # Decide early, when the token is still far enough away to reach.
+        if t['y'] < TOKEN_DECISION_Y_MIN:
+            continue
+
+        candidate = {
+            'lane': t_lane,
+            'y': t['y'],
+            'color': color,
+            'score': token_priority[color]
+        }
+
+        if best_token is None:
+            best_token = candidate
+        elif candidate['score'] > best_token['score']:
+            best_token = candidate
+        elif candidate['score'] == best_token['score'] and candidate['y'] < best_token['y']:
+            best_token = candidate
 
     # =========================================================
-    # 3. PATHFINDING DECISION MATRIX
+    # 3. GREEN-FIRST TARGET DECISION
     # =========================================================
     chosen_target_lane = None
     decision_reason = "MAINTAIN"
 
-    # Step A: Find greens that do NOT contain red/yellow hazards in their lanes
-    safe_greens = [g for g in green_targets if g['lane'] not in completely_blocked_lanes]
-    
-    if safe_greens:
-        # Target the furthest away safe green token to maximize path preparation time
-        best_green = min(safe_greens, key=lambda item: item['y'])
-        chosen_target_lane = best_green['lane']
-        decision_reason = "COLLECT_SAFE_GREEN"
+    if best_token is not None:
+        chosen_target_lane = best_token['lane']
+        decision_reason = f"COLLECT_{best_token['color'].upper()}"
         last_token_lane = chosen_target_lane
         last_token_time = time.time()
-        
-    elif green_targets:
-        # If all greens are in high-risk lanes, it's better to avoid than to collect!
-        decision_reason = "ABORT_GREEN_DUE_TO_HAZARD"
 
     # Memory Fallback: Prevent aborting mid-maneuver due to camera sensor noise
     if chosen_target_lane is None and last_token_lane is not None:
-        if time.time() - last_token_time < 0.4 and last_token_lane not in completely_blocked_lanes:
+        if time.time() - last_token_time < 0.6:
             chosen_target_lane = last_token_lane
-            decision_reason = "SAFE_GREEN_MEMORY"
-
-    # Escape Strategy: If current lane gets blocked by a red/yellow, step away immediately
-    if chosen_target_lane is None and current_lane in completely_blocked_lanes:
-        escapes = [l for l in [-2, -1, 0, 1, 2] if l not in completely_blocked_lanes]
-        if escapes:
-            # Shift to the closest clear adjacent lane
-            chosen_target_lane = min(escapes, key=lambda l: abs(l - current_lane))
-            decision_reason = "EMERGENCY_HAZARD_ESCAPE"
+            decision_reason = "TOKEN_MEMORY"
 
     # Baseline Strategy
     if chosen_target_lane is None:
@@ -794,8 +787,7 @@ def send_controls_task():
             steering_state = 1
             tap_loop_count = 0
             with data_lock:
-                # Move incrementally one lane at a time to remain perfectly stable
-                shared_data['target_lane'] = current_lane + (1 if chosen_target_lane > current_lane else -1)
+                shared_data['target_lane'] = chosen_target_lane
 
     elif steering_state == 1:
         with data_lock:
@@ -824,7 +816,7 @@ def send_controls_task():
             steering_state = 0
 
     with data_lock:
-        shared_data['decision_debug'] = f"Reason: {decision_reason} | Blocked Lanes: {list(completely_blocked_lanes)} | GoTo: {chosen_target_lane}"
+        shared_data['decision_debug'] = f"Reason: {decision_reason} | GoTo: {chosen_target_lane}"
 
     try:
         data = struct.pack('ff', float(steering_input), float(acceleration_input))
