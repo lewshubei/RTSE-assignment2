@@ -1102,3 +1102,4 @@ if __name__ == '__main__':
             for effect_name, effect_count in yellow_effects.items():
                 print(f"  - {effect_name}: {effect_count}")
     print("="*45 + "\n")
+    
