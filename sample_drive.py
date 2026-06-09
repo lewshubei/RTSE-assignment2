@@ -379,7 +379,7 @@ def draw_detected_tokens(frame, tokens):
     vehicle_base_x = int(frame_w / 2)
     vehicle_base_y = int(frame_h)
 
-    # Cutoff line matching target thresholds (tokens lower than 62% screen height are too close to safely alter course)
+    # Cutoff line matching target thresholds
     green_y_deadline = frame_h * 0.62 
 
     overlay = display_frame.copy()
@@ -395,43 +395,28 @@ def draw_detected_tokens(frame, tokens):
         y2 = min(center[1]+radius, frame_h-1)
         cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
         
+        # --- SAFE DISTANCE STRING CONVERSION ---
+        dist_val = token.get('distance', 0)
+        if dist_val == float('inf'):
+            dist_str = "INF"
+        else:
+            dist_str = f"{int(dist_val)}m"
+        
         # Draw Target Vector Lines
         if token["color"] == "green":
             if token["y"] < green_y_deadline:
                 cv2.line(display_frame, (vehicle_base_x, vehicle_base_y), center, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.putText(display_frame, f"LOCKED ({int(token.get('distance', 0))}m)", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 2)
+                cv2.putText(display_frame, f"LOCKED ({dist_str})", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 2)
             else:
                 cv2.putText(display_frame, "TOO CLOSE", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         else:
-            cv2.putText(display_frame, f"DIST: {int(token.get('distance', 0))}m", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(display_frame, f"DIST: {dist_str}", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
         cv2.putText(display_frame, token["color"].upper(), (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     alpha = 0.3
     cv2.addWeighted(overlay, alpha, display_frame, 1-alpha, 0, display_frame)
     return display_frame
-
-def lane_from_x(x, y=None, frame_width=640, frame_height=480):
-    if y is None:
-        lane_width = frame_width / 5
-        return max(-2, min(2, int(x // lane_width) - 2))
-        
-    vp_x = frame_width / 2.0
-    vp_y = frame_height * 0.45  
-    
-    if y <= vp_y:
-        lane_width = frame_width / 5
-        return max(-2, min(2, int(x // lane_width) - 2))
-        
-    dy = y - vp_y
-    dx = x - vp_x
-    slope = dx / dy
-    
-    if slope < -0.6: return -2
-    elif slope < -0.2: return -1
-    elif slope < 0.2: return 0
-    elif slope < 0.6: return 1
-    else: return 2
 
 def detect_trailing_and_police(back_frame):
     if back_frame is None: return False, False, 0.0, None
