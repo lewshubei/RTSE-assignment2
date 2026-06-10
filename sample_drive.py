@@ -13,6 +13,7 @@ import random
 # ---------------------------------------------------------
 CAMERA_HOST = '127.0.0.1'
 FRONT_CAMERA_PORT = 8080
+BACK_CAMERA_PORT = 8082
 CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
 START_LANE = 0
@@ -56,6 +57,7 @@ YELLOW_EFFECTS = [
 # Shared Resources with Mutex Lock for Concurrency
 shared_data = {
     'latest_front_frame': None,
+    'latest_back_frame': None,
     'steering_input': 0.0,
     'acceleration_input': 0.0,
     'detected_tokens': [],
@@ -135,21 +137,46 @@ class RTTask(threading.Thread):
 # Network Connection Setup (Do not change this in your code)
 # ---------------------------------------------------------
 front_camera_sock = None
+back_camera_sock = None
 control_conn = None
 
-def setup_front_camera():
-    """Connect only the front camera while the token subsystem is developed."""
-    global front_camera_sock
+def setup_cameras():
+    """
+    Connect both camera streams.
 
-    print("Connecting to Front Camera...")
-    while is_running and front_camera_sock is None:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
-            sock.connect((CAMERA_HOST, FRONT_CAMERA_PORT))
-            front_camera_sock = sock
-            print("Connected to Front Camera successfully.")
-        except Exception:
+    The front camera is used for token processing. The back camera is retained
+    as a live preview only so a teammate can add rear-event handling later.
+    """
+    global front_camera_sock, back_camera_sock
+
+    print("Connecting to Cameras...")
+    front_connected = False
+    back_connected = False
+
+    while is_running and not (front_connected and back_connected):
+        if not front_connected:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                sock.connect((CAMERA_HOST, FRONT_CAMERA_PORT))
+                front_camera_sock = sock
+                front_connected = True
+                print("Connected to Front Camera successfully.")
+            except Exception:
+                pass
+
+        if not back_connected:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                sock.connect((CAMERA_HOST, BACK_CAMERA_PORT))
+                back_camera_sock = sock
+                back_connected = True
+                print("Connected to Back Camera successfully.")
+            except Exception:
+                pass
+
+        if not (front_connected and back_connected):
             time.sleep(1)
 
 def setup_control_server():
@@ -235,6 +262,10 @@ def read_single_camera(sock, window_name, data_key, display=True):
 
 def read_front_camera_task():
     read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame', display=False)
+
+def read_back_camera_task():
+    # Preview only: rear-event detection will be added separately by the team.
+    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame', display=False)
 
 def adjust_gamma(image, gamma=1.5):
     invGamma = 1.0 / gamma
@@ -772,9 +803,27 @@ def send_control_packet(steering_input, acceleration_input):
     control_conn.sendall(delayed_data)
 
 def processing_task():
-    """Detect front-camera tokens and publish a debug frame."""
+    """
+    Detect tokens from the front camera and display both camera previews.
+
+    Rear-camera frames are intentionally not analysed in this token-only
+    version. They are displayed so rear-event processing can be integrated
+    later without changing the camera connection architecture again.
+    """
     with data_lock:
-        front_frame = shared_data['latest_front_frame']
+        front_frame = shared_data.get('latest_front_frame')
+        back_frame = shared_data.get('latest_back_frame')
+
+    # Show an unmodified rear preview. Yellow camera effects apply to the
+    # front perception input only because token detection uses the front view.
+    if back_frame is not None:
+        back_debug_frame = cv2.resize(back_frame, (640, 480))
+        cv2.putText(
+            back_debug_frame, "Back Camera Preview Only", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2
+        )
+        cv2.imshow("Back Camera", back_debug_frame)
+        cv2.waitKey(1)
 
     if front_frame is None:
         return
@@ -1049,19 +1098,21 @@ if __name__ == '__main__':
 
     print("Initializing RTSE Sample Drive...")
 
-    # Initialize front-camera and control connections
+    # Initialize front camera, back-camera preview, and control connections
     threading.Thread(target=setup_control_server, daemon=True).start()
-    threading.Thread(target=setup_front_camera, daemon=True).start()
+    threading.Thread(target=setup_cameras, daemon=True).start()
     
     print("\n--- Starting Real-Time Tasks (awaiting connections dynamically) ---\n")
     
     # Define and start real-time tasks
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
+    t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     
     # Start tasks to run concurrently
     t_front_camera.start()
+    t_back_camera.start()
     t_processing.start()
     t_controls.start()
 
@@ -1074,11 +1125,14 @@ if __name__ == '__main__':
 
     # Clean shutdown
     t_front_camera.join()
+    t_back_camera.join()
     t_processing.join()
     t_controls.join()
     
     if front_camera_sock:
         front_camera_sock.close()
+    if back_camera_sock:
+        back_camera_sock.close()
     if control_conn:
         control_conn.close()
     cv2.destroyAllWindows()
@@ -1102,4 +1156,3 @@ if __name__ == '__main__':
             for effect_name, effect_count in yellow_effects.items():
                 print(f"  - {effect_name}: {effect_count}")
     print("="*45 + "\n")
-    
