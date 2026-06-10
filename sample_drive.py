@@ -806,68 +806,147 @@ def processing_task():
     """
     Detect tokens from the front camera and display both camera previews.
 
-    Rear-camera frames are intentionally not analysed in this token-only
-    version. They are displayed so rear-event processing can be integrated
-    later without changing the camera connection architecture again.
+    The back-camera frame is displayed only as a live preview.
+    Police-car and trailing-car detection are intentionally disabled for now.
     """
+
+    # Copy the latest frames safely from shared memory.
     with data_lock:
         front_frame = shared_data.get('latest_front_frame')
         back_frame = shared_data.get('latest_back_frame')
 
-    # Show an unmodified rear preview. Yellow camera effects apply to the
-    # front perception input only because token detection uses the front view.
+    window_updated = False
+
+    # ---------------------------------------------------------
+    # 1. Display back-camera preview only
+    # ---------------------------------------------------------
     if back_frame is not None:
-        back_debug_frame = cv2.resize(back_frame, (640, 480))
-        cv2.putText(
-            back_debug_frame, "Back Camera Preview Only", (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2
-        )
-        cv2.imshow("Back Camera", back_debug_frame)
+        try:
+            back_debug_frame = back_frame.copy()
+
+            cv2.putText(
+                back_debug_frame,
+                "Back Camera Preview",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+            back_debug_frame = cv2.resize(
+                back_debug_frame,
+                (640, 480)
+            )
+
+            cv2.imshow("Back Camera", back_debug_frame)
+            window_updated = True
+
+        except Exception as e:
+            print(f"Back camera display error: {e}")
+
+    # ---------------------------------------------------------
+    # 2. Process tokens using the front camera only
+    # ---------------------------------------------------------
+    if front_frame is not None:
+        try:
+            # Apply any active yellow-token camera effect.
+            processed_front_frame = apply_camera_effects(front_frame)
+
+            # Detect green, yellow and red tokens.
+            tokens = detect_colored_tokens(processed_front_frame)
+
+            # Apply yellow-token visibility effects when active.
+            tokens = apply_token_visibility_effects(tokens)
+
+            with data_lock:
+                shared_data['detected_tokens'] = tokens
+
+            # Draw token overlays.
+            debug_frame = draw_detected_tokens(
+                processed_front_frame,
+                tokens
+            )
+
+            with data_lock:
+                decision_text = shared_data.get(
+                    'decision_debug',
+                    ''
+                )
+                target_debug = shared_data.get(
+                    'target_token_debug'
+                )
+
+            # Display the current driving decision.
+            if decision_text:
+                cv2.putText(
+                    debug_frame,
+                    decision_text,
+                    (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (255, 255, 255),
+                    2
+                )
+
+            # Mark the selected green-token target.
+            if target_debug is not None:
+                target_token = target_debug.get('token', {})
+
+                tx = int(target_token.get('x', 0))
+                ty = int(target_token.get('y', 0))
+
+                cv2.circle(
+                    debug_frame,
+                    (tx, ty),
+                    10,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    debug_frame,
+                    (
+                        f"TARGET D="
+                        f"{target_debug.get('image_distance', 0.0):.3f}"
+                    ),
+                    (max(tx - 85, 0), max(ty - 24, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (255, 255, 255),
+                    2
+                )
+
+            # Display the active yellow-token disruption effect.
+            effect = get_active_yellow_effect()
+
+            if effect:
+                cv2.putText(
+                    debug_frame,
+                    f"Yellow Effect: {effect}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2
+                )
+
+            debug_frame = cv2.resize(
+                debug_frame,
+                (640, 480)
+            )
+
+            cv2.imshow("Front Camera", debug_frame)
+            window_updated = True
+
+        except Exception as e:
+            print(f"Front camera processing error: {e}")
+
+    # ---------------------------------------------------------
+    # 3. Refresh OpenCV windows
+    # ---------------------------------------------------------
+    if window_updated:
         cv2.waitKey(1)
-
-    if front_frame is None:
-        return
-
-    processed_front_frame = apply_camera_effects(front_frame)
-    tokens = detect_colored_tokens(processed_front_frame)
-    tokens = apply_token_visibility_effects(tokens)
-
-    with data_lock:
-        shared_data['detected_tokens'] = tokens
-
-    debug_frame = draw_detected_tokens(processed_front_frame, tokens)
-    with data_lock:
-        decision_text = shared_data.get('decision_debug', '')
-        target_debug = shared_data.get('target_token_debug')
-
-    if decision_text:
-        cv2.putText(
-            debug_frame, decision_text, (10, 55),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2
-        )
-
-    if target_debug is not None:
-        target_token = target_debug.get('token', {})
-        tx = int(target_token.get('x', 0))
-        ty = int(target_token.get('y', 0))
-        cv2.circle(debug_frame, (tx, ty), 10, (255, 255, 255), 2)
-        cv2.putText(
-            debug_frame,
-            f"TARGET D={target_debug.get('image_distance', 0.0):.3f}",
-            (max(tx - 85, 0), max(ty - 24, 20)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2
-        )
-
-    effect = get_active_yellow_effect()
-    if effect:
-        cv2.putText(
-            debug_frame, f"Yellow Effect: {effect}", (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
-        )
-
-    debug_frame = cv2.resize(debug_frame, (640, 480))
-    cv2.imshow("Front Camera", debug_frame)
-    cv2.waitKey(1)
 
 
 # Global variables for strict tap-based lane changes
