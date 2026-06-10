@@ -4,6 +4,7 @@ import struct
 import cv2
 import numpy as np
 import time
+import keyboard
 import select
 import ctypes
 import random
@@ -20,62 +21,25 @@ START_LANE = 0
 START_CENTER_HOLD_SECONDS = 2.0
 CAR_ACCELERATION = 0.78
 GREEN_CHASE_ACCELERATION = 0.62
+GREEN_STEER_GAIN = 2.8
+GREEN_STEER_DEADZONE = 0.015
+GREEN_MIN_STEER = 0.18
+MIN_LOOKAHEAD_Y_RATIO = 0.25
+LINE_GROUP_Y_RATIO = 0.08
+LANE_CHANGE_TIME_Y_RATIO = 0.14
+GREEN_LOCK_SECONDS = 1.6
+STEER_TAP_LOOPS = 12
+STEER_RESET_LOOPS = 4
 TOKEN_DECISION_Y_MIN = 70
-TOKEN_TARGET_MEMORY_SECONDS = 0.22
-GREEN_TARGET_LOCK_SECONDS = 0.35
+LANE_CHANGE_TAP_LOOPS = 24
+LANE_CHANGE_RESET_LOOPS = 2
+TOKEN_TARGET_MEMORY_SECONDS = 1.8
+GREEN_TARGET_LOCK_SECONDS = 2.2
 YELLOW_EFFECT_DURATION_SECONDS = 5.0
 TOKEN_COLLECTION_Y_RATIO = 0.78
 TOKEN_COLLECTION_COOLDOWN_SECONDS = 0.7
 CAMERA_DELAY_SECONDS = 5.0
 ACTION_DELAY_SECONDS = 5.0
-
-# Five-lane token targeting
-# Lane changes must use tap-based steering only: neutral -> +/-1.0 tap -> neutral.
-LANE_CHANGE_PRE_TAP_LOOPS = 2
-LANE_CHANGE_TAP_LOOPS = 24
-LANE_CHANGE_RESET_LOOPS = 4
-LANE_CHANGE_TIME_Y_RATIO = 0.14
-GREEN_REACHABILITY_BASE_MARGIN = 0.035
-CAR_PICKUP_X_RATIO = 0.50
-
-# Hazard avoidance during normal driving. Red and yellow tokens remain detected,
-# but the token-only controller does not intentionally collect them. Lane values
-# from the camera are RELATIVE offsets and must be converted before planning.
-UNWANTED_TOKEN_AVOID_Y_RATIO = 0.30
-EMERGENCY_HAZARD_Y_RATIO = 0.42
-EMERGENCY_ESCAPE_ACCELERATION = 0.34
-EMERGENCY_BRAKE_ACCELERATION = 0.24
-YELLOW_EFFECT_SAFE_ACCELERATION = 0.38
-YELLOW_HAZARD_PENALTY = 20.0
-RED_HAZARD_PENALTY = 18.0
-LANE_SWITCH_PENALTY = 0.35
-GREEN_LANE_REWARD = 2.5
-
-# Accuracy improvements -------------------------------------------------------
-# Green tokens must persist across new camera frames before the car chases them.
-# Two frames is a good initial balance between recall and false-positive control.
-GREEN_CONFIRM_FRAMES = 2
-TOKEN_TRACK_MAX_MISSES = 4
-TOKEN_TRACK_MAX_AGE_SECONDS = 0.45
-TOKEN_TRACK_MATCH_DISTANCE_RATIO = 0.075
-STALE_FRONT_FRAME_SECONDS = 0.35
-
-# A hidden type must be treated as dangerous. Do not use its internal true colour
-# when selecting a lane; the true colour is retained only for local bookkeeping.
-UNKNOWN_HAZARD_PENALTY = 24.0
-HAZARD_BLOCK_Y_MARGIN_RATIO = 0.10
-
-# Road-only region of interest. Tune these ratios from a simulator screenshot if
-# the visible road geometry changes. The polygon is intentionally broad initially.
-ROAD_ROI_TOP_Y_RATIO = 0.10
-ROAD_ROI_TOP_LEFT_X_RATIO = 0.30
-ROAD_ROI_TOP_RIGHT_X_RATIO = 0.70
-ROAD_ROI_BOTTOM_Y_RATIO = 0.99
-ROAD_ROI_BOTTOM_LEFT_X_RATIO = 0.00
-ROAD_ROI_BOTTOM_RIGHT_X_RATIO = 1.00
-SHOW_ROAD_ROI = True
-SHOW_TOKEN_MASKS = False
-
 YELLOW_EFFECTS = [
     'hide_next_token_type',
     'tokens_invisible',
@@ -88,14 +52,20 @@ YELLOW_EFFECTS = [
 shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
-    'front_frame_seq': 0,
-    'front_frame_time': 0.0,
-    'steering_input': 0.0,
-    'acceleration_input': 0.0,
+    'steering_input' : 0.0,
+    'acceleration_input' : 0.0,
     'detected_tokens': [],
-    'target_lane': START_LANE,
-    'decision_debug': '',
-    'target_token_debug': None,
+    'target_lane': START_LANE, # Default: Stay in Center Lane (0)
+    'danger_detected': False,  # Default: No trailing car danger
+    'decision_debug': ''
+}
+
+# Additional shared flags / history for trailing/police detection
+shared_data.update({
+    'police_detected': False,
+    'trailing_detected': False,
+    'back_prev_gray': None,
+    'back_prev_area': 0.0,
     'run_summary': {
         'green_collected': 0,
         'red_collected': 0,
@@ -106,7 +76,9 @@ shared_data = {
             'camera_input_delay': 0,
             'action_output_delay': 0,
             'corrupted_camera_input': 0
-        }
+        },
+        'police_appeared': False,
+        'trailing_appeared': False
     },
     'active_yellow_effect': None,
     'yellow_effect_until': 0.0,
@@ -114,17 +86,20 @@ shared_data = {
     'last_collected_time': 0.0,
     'last_collected_line_id': None,
     'last_collected_by_lane_color': {}
-}
+})
 data_lock = threading.Lock()
 is_running = True
 front_camera_delay_buffer = []
 action_delay_buffer = []
 
-# Token tracks are updated only by the processing task when a new camera frame
-# arrives. The control task reads the resulting snapshot from shared_data.
-token_tracks = {}
-next_token_track_id = 1
-last_processed_front_seq = -1
+# Back-camera detection tuning
+TRAILING_MOTION_AREA_MIN = 3500
+TRAILING_APPROACH_RATIO = 1.15
+POLICE_MIN_COLOR_AREA = 300
+POLICE_ROI_X_START = 0.20
+POLICE_ROI_X_END = 0.80
+POLICE_ROI_Y_START = 0.35
+POLICE_ROI_Y_END = 0.95
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -179,41 +154,35 @@ back_camera_sock = None
 control_conn = None
 
 def setup_cameras():
-    """
-    Connect both camera streams.
-
-    The front camera is used for token processing. The back camera is retained
-    as a live preview only so a teammate can add rear-event handling later.
-    """
     global front_camera_sock, back_camera_sock
-
+    
     print("Connecting to Cameras...")
     front_connected = False
     back_connected = False
-
+    
     while is_running and not (front_connected and back_connected):
         if not front_connected:
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
-                sock.connect((CAMERA_HOST, FRONT_CAMERA_PORT))
-                front_camera_sock = sock
-                front_connected = True
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect((CAMERA_HOST, FRONT_CAMERA_PORT))
+                front_camera_sock = s
                 print("Connected to Front Camera successfully.")
+                front_connected = True
             except Exception:
                 pass
-
+                
         if not back_connected:
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
-                sock.connect((CAMERA_HOST, BACK_CAMERA_PORT))
-                back_camera_sock = sock
-                back_connected = True
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect((CAMERA_HOST, BACK_CAMERA_PORT))
+                back_camera_sock = s
                 print("Connected to Back Camera successfully.")
+                back_connected = True
             except Exception:
                 pass
-
+                
         if not (front_connected and back_connected):
             time.sleep(1)
 
@@ -288,9 +257,6 @@ def read_single_camera(sock, window_name, data_key, display=True):
             if frame is not None:
                 with data_lock:
                     shared_data[data_key] = frame
-                    if data_key == 'latest_front_frame':
-                        shared_data['front_frame_seq'] += 1
-                        shared_data['front_frame_time'] = time.monotonic()
                 
                 if display:
                     # You may disable this if you don't need to display the frames / This could effect the fps
@@ -305,164 +271,89 @@ def read_front_camera_task():
     read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame', display=False)
 
 def read_back_camera_task():
-    # Preview only: rear-event detection will be added separately by the team.
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame', display=False)
-
 def adjust_gamma(image, gamma=1.5):
     invGamma = 1.0 / gamma
-    table = np.array([((i / 255.0) ** invGamma) * 255
+    table = np.array([((i/255.0) ** invGamma) * 255
                       for i in np.arange(256)]).astype("uint8")
     return cv2.LUT(image, table)
-
-
-def get_visible_color(token):
-    """Return only the colour that perception is currently allowed to use."""
-    return token.get('color')
-
-
-def get_actual_color(token):
-    """Return the actual colour for collection statistics and yellow effects only."""
-    return token.get('true_color', token.get('color'))
-
-
-def create_road_roi(frame_h, frame_w):
-    """Create a broad trapezoidal mask covering the drivable road surface."""
-    points = np.array([
-        [int(frame_w * ROAD_ROI_TOP_LEFT_X_RATIO),
-         int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
-        [int(frame_w * ROAD_ROI_TOP_RIGHT_X_RATIO),
-         int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
-        [int(frame_w * ROAD_ROI_BOTTOM_RIGHT_X_RATIO),
-         int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)],
-        [int(frame_w * ROAD_ROI_BOTTOM_LEFT_X_RATIO),
-         int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)]
-    ], dtype=np.int32)
-
-    roi = np.zeros((frame_h, frame_w), dtype=np.uint8)
-    cv2.fillPoly(roi, [points], 255)
-    return roi
-
-
-def passes_round_token_shape(cnt, frame_w, frame_h, color_name):
-    """Validate a candidate using scaled area, roundness and circle fill ratio."""
-    area = cv2.contourArea(cnt)
-    frame_area = float(frame_w * frame_h)
-
-    if color_name == 'red':
-        min_area = max(55.0, frame_area * 0.00018)
-        min_circularity = 0.46
-        min_fill_ratio = 0.43
-        min_aspect, max_aspect = 0.58, 1.55
-    elif color_name == 'yellow':
-        min_area = max(35.0, frame_area * 0.00010)
-        min_circularity = 0.62
-        min_fill_ratio = 0.47
-        min_aspect, max_aspect = 0.62, 1.48
-    else:  # green
-        min_area = max(35.0, frame_area * 0.00010)
-        min_circularity = 0.48
-        min_fill_ratio = 0.40
-        min_aspect, max_aspect = 0.58, 1.55
-
-    max_area = frame_area * 0.18
-    if area < min_area or area > max_area:
-        return None
-
-    x, y, width, height = cv2.boundingRect(cnt)
-    if height <= 0:
-        return None
-
-    aspect_ratio = width / float(height)
-    if not (min_aspect <= aspect_ratio <= max_aspect):
-        return None
-
-    perimeter = cv2.arcLength(cnt, True)
-    if perimeter <= 0:
-        return None
-
-    circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-    if circularity < min_circularity:
-        return None
-
-    (center_x, center_y), radius = cv2.minEnclosingCircle(cnt)
-    if radius < 3.0:
-        return None
-
-    fill_ratio = area / (np.pi * radius * radius)
-    if fill_ratio < min_fill_ratio:
-        return None
-
-    # Exclude HUD fragments and extreme lower-edge fragments.
-    if center_y < frame_h * 0.08 or center_y > frame_h * 0.94:
-        return None
-
-    return {
-        'color': color_name,
-        'x': int(center_x),
-        'y': int(center_y),
-        'radius': int(radius),
-        'area': float(area),
-        'circularity': float(circularity),
-        'fill_ratio': float(fill_ratio)
-    }
-
-
 def detect_colored_tokens(frame):
     """
-    Detect green, yellow and red circular tokens inside the drivable road ROI.
+    Detect green, yellow, and red circular tokens from the front camera.
 
-    Green/yellow masks are generated from a gamma-corrected image. Red is
-    generated from the original image because pale red gradients are easier to
-    retain before brightness correction.
+    Red tokens are pale pink/red because of their gradient.  They need a
+    separate mask made from the original frame.  The red road markings and
+    the player's car are normally much more saturated, so an upper saturation
+    limit is used to reject them.
     """
     frame_h, frame_w = frame.shape[:2]
-    road_roi = create_road_roi(frame_h, frame_w)
 
+    # Gamma correction is useful for distant green and yellow tokens.
     frame_bright = adjust_gamma(frame, gamma=1.5)
     hsv_bright = cv2.cvtColor(frame_bright, cv2.COLOR_BGR2HSV)
+
+    # Use the original image for red. Gamma correction reduces the saturation
+    # contrast of the pale red token and can leave only a fragmented contour.
     hsv_original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     detected_tokens = []
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    standard_kernel = np.ones((5, 5), np.uint8)
 
-    # Keep the HSV values easy to tune after testing recorded simulator frames.
+    # -----------------------------------------------------
+    # Green and yellow detection
+    # -----------------------------------------------------
     standard_color_ranges = {
-        'green': [((50, 30, 150), (70, 255, 255))],
-        'yellow': [((18, 50, 140), (30, 255, 255))]
+        "green": [((50, 30, 150), (70, 255, 255))],
+        "yellow": [((18, 50, 140), (30, 255, 255))]
     }
-
-    debug_masks = {}
 
     for color_name, ranges in standard_color_ranges.items():
         color_mask = None
+
         for lower, upper in ranges:
             current_mask = cv2.inRange(
                 hsv_bright,
                 np.array(lower, dtype=np.uint8),
                 np.array(upper, dtype=np.uint8)
             )
-            color_mask = (
-                current_mask if color_mask is None
-                else cv2.bitwise_or(color_mask, current_mask)
-            )
+            color_mask = current_mask if color_mask is None else cv2.bitwise_or(color_mask, current_mask)
 
-        # Closing reconnects fragmented token pixels; the smaller opening
-        # kernel suppresses noise without deleting small distant tokens.
-        color_mask = cv2.bitwise_and(color_mask, road_roi)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, close_kernel)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, open_kernel)
-        debug_masks[color_name] = color_mask
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, standard_kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, standard_kernel)
 
-        contours, _ = cv2.findContours(
-            color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         for cnt in contours:
-            token = passes_round_token_shape(cnt, frame_w, frame_h, color_name)
-            if token is not None:
-                detected_tokens.append(token)
+            area = cv2.contourArea(cnt)
+            if area < 100 or area > 300000:
+                continue
 
-    # OpenCV hue wraps around: red is near both 0 and 179.
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                continue
+
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            min_circularity = 0.50 if color_name == "green" else 0.75
+            if circularity < min_circularity:
+                continue
+
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
+            detected_tokens.append({
+                "color": color_name,
+                "x": int(x),
+                "y": int(y),
+                "radius": int(radius),
+                "area": float(area)
+            })
+
+    # -----------------------------------------------------
+    # Red token detection
+    # -----------------------------------------------------
+    # OpenCV hue wraps around: red exists near both 0 and 179.
+    #
+    # The token is a light pink/red gradient. Saturation is deliberately
+    # limited to 20..200 to retain the pale token while rejecting strongly
+    # saturated red road borders and most of the player's red car.
     red_mask_1 = cv2.inRange(
         hsv_original,
         np.array((0, 20, 145), dtype=np.uint8),
@@ -474,182 +365,105 @@ def detect_colored_tokens(frame):
         np.array((179, 200, 255), dtype=np.uint8)
     )
     red_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
-    red_mask = cv2.bitwise_and(red_mask, road_roi)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, close_kernel)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, open_kernel)
-    debug_masks['red'] = red_mask
 
-    red_contours, _ = cv2.findContours(
-        red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    # Close first to reconnect the token's gradient. Use a smaller opening
+    # kernel afterwards so distant tokens are not erased.
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Scale the minimum area so the detector works at different resolutions.
+    red_min_area = max(70.0, frame_w * frame_h * 0.00030)
+    red_max_area = frame_w * frame_h * 0.20
+
     for cnt in red_contours:
-        token = passes_round_token_shape(cnt, frame_w, frame_h, 'red')
-        if token is not None:
-            detected_tokens.append(token)
+        area = cv2.contourArea(cnt)
+        if area < red_min_area or area > red_max_area:
+            continue
 
-    if SHOW_TOKEN_MASKS:
-        for color_name, mask in debug_masks.items():
-            cv2.imshow(
-                f'{color_name.title()} Token Mask',
-                cv2.resize(mask, (640, 480))
-            )
+        x, y, width, height = cv2.boundingRect(cnt)
+        if height == 0:
+            continue
+
+        aspect_ratio = width / float(height)
+        if not (0.58 <= aspect_ratio <= 1.55):
+            continue
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        (center_x, center_y), radius = cv2.minEnclosingCircle(cnt)
+
+        if radius <= 0:
+            continue
+
+        circle_fill_ratio = area / (np.pi * radius * radius)
+
+        # These filters retain round red tokens while rejecting thin road
+        # markings, roadside arrows and irregular red parts of the car.
+        if circularity < 0.46 or circle_fill_ratio < 0.43:
+            continue
+
+        # Ignore HUD text at the top and small fragments near the bottom edge.
+        if center_y < frame_h * 0.20 or center_y > frame_h * 0.92:
+            continue
+
+        detected_tokens.append({
+            "color": "red",
+            "x": int(center_x),
+            "y": int(center_y),
+            "radius": int(radius),
+            "area": float(area)
+        })
+
+    # Optional tuning window. Uncomment temporarily if you need to inspect
+    # which pixels are selected as red:
+    # cv2.imshow("Red Token Mask", cv2.resize(red_mask, (640, 480)))
+    # cv2.waitKey(1)
 
     return detected_tokens
 
-
-def update_token_tracks(detections, frame_width, frame_height):
-    """
-    Add stable track IDs and consecutive-frame hit counts.
-
-    The controller chases a green token only after GREEN_CONFIRM_FRAMES hits.
-    Hazard colours remain immediately usable so red/yellow avoidance is fast.
-    """
-    global next_token_track_id
-
-    now = time.monotonic()
-    unmatched_track_ids = set(token_tracks.keys())
-    tracked_detections = []
-
-    # Nearest objects are matched first because they are the most safety-critical.
-    for detection in sorted(detections, key=lambda item: item['y'], reverse=True):
-        actual_color = get_actual_color(detection)
-        detection_lane = lane_from_x(
-            detection['x'], detection['y'],
-            frame_width=frame_width,
-            frame_height=frame_height
-        )
-
-        best_track_id = None
-        best_distance = float('inf')
-
-        for track_id in unmatched_track_ids:
-            track = token_tracks[track_id]
-            if track['actual_color'] != actual_color:
-                continue
-
-            track_lane = lane_from_x(
-                track['x'], track['y'],
-                frame_width=frame_width,
-                frame_height=frame_height
-            )
-            if abs(track_lane - detection_lane) > 1:
-                continue
-
-            distance = float(np.hypot(
-                detection['x'] - track['x'],
-                detection['y'] - track['y']
-            ))
-            match_limit = max(
-                24.0,
-                frame_width * TOKEN_TRACK_MATCH_DISTANCE_RATIO,
-                3.0 * max(detection['radius'], track['radius'])
-            )
-
-            if distance <= match_limit and distance < best_distance:
-                best_track_id = track_id
-                best_distance = distance
-
-        if best_track_id is None:
-            track_id = next_token_track_id
-            next_token_track_id += 1
-            previous_y = detection['y']
-            token_tracks[track_id] = {
-                'x': detection['x'],
-                'y': detection['y'],
-                'radius': detection['radius'],
-                'actual_color': actual_color,
-                'hits': 1,
-                'misses': 0,
-                'last_seen': now
-            }
-        else:
-            track_id = best_track_id
-            track = token_tracks[track_id]
-            previous_y = track['y']
-            track.update({
-                'x': detection['x'],
-                'y': detection['y'],
-                'radius': detection['radius'],
-                'actual_color': actual_color,
-                'hits': track['hits'] + 1,
-                'misses': 0,
-                'last_seen': now
-            })
-            unmatched_track_ids.remove(track_id)
-
-        enriched = dict(detection)
-        enriched['track_id'] = track_id
-        enriched['hits'] = token_tracks[track_id]['hits']
-        enriched['previous_y'] = previous_y
-        tracked_detections.append(enriched)
-
-    for track_id in list(unmatched_track_ids):
-        track = token_tracks.get(track_id)
-        if track is None:
-            continue
-        track['misses'] += 1
-        if (
-            track['misses'] > TOKEN_TRACK_MAX_MISSES
-            or now - track['last_seen'] > TOKEN_TRACK_MAX_AGE_SECONDS
-        ):
-            token_tracks.pop(track_id, None)
-
-    return tracked_detections
-
 def draw_detected_tokens(frame, tokens):
-    """Draw detected tokens, temporal hit counts and the road ROI."""
+    """
+    Draw bounding boxes and semi-transparent overlays for all detected tokens.
+    """
     display_frame = frame.copy()
     frame_h, frame_w = display_frame.shape[:2]
 
     text_colors = {
-        'green': (0, 255, 0),
-        'yellow': (0, 255, 255),
-        'red': (0, 0, 255),
-        'hidden': (255, 255, 255)
+        "green": (0, 255, 0),
+        "yellow": (0, 255, 255),
+        "red": (0, 0, 255),
+        "hidden": (255, 255, 255)
     }
-
-    if SHOW_ROAD_ROI:
-        roi_points = np.array([
-            [int(frame_w * ROAD_ROI_TOP_LEFT_X_RATIO), int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
-            [int(frame_w * ROAD_ROI_TOP_RIGHT_X_RATIO), int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
-            [int(frame_w * ROAD_ROI_BOTTOM_RIGHT_X_RATIO), int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)],
-            [int(frame_w * ROAD_ROI_BOTTOM_LEFT_X_RATIO), int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)]
-        ], dtype=np.int32)
-        cv2.polylines(display_frame, [roi_points], True, (255, 255, 255), 1)
 
     overlay = display_frame.copy()
     for token in tokens:
-        visible_color = get_visible_color(token)
-        color = text_colors.get(visible_color, (255, 255, 255))
-        center = (token['x'], token['y'])
-        radius = token['radius']
-
+        color = text_colors.get(token["color"], (255, 255, 255))
+        center = (token["x"], token["y"])
+        radius = token["radius"]
+        # Semi-transparent filled circle
         cv2.circle(overlay, center, radius, color, -1)
-
-        x1 = max(center[0] - radius, 0)
-        y1 = max(center[1] - radius, 0)
-        x2 = min(center[0] + radius, frame_w - 1)
-        y2 = min(center[1] + radius, frame_h - 1)
+        # Bounding box
+        x1 = max(center[0]-radius, 0)
+        y1 = max(center[1]-radius, 0)
+        x2 = min(center[0]+radius, frame_w-1)
+        y2 = min(center[1]+radius, frame_h-1)
         cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+        # Color label
+        cv2.putText(display_frame, token["color"].upper(), (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        label = visible_color.upper()
-        if 'track_id' in token:
-            label += f" T{token['track_id']} H{token.get('hits', 1)}"
-        cv2.putText(
-            display_frame, label, (x1, max(y1 - 10, 18)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2
-        )
-
-    cv2.addWeighted(overlay, 0.30, display_frame, 0.70, 0, display_frame)
+    # Blend overlay with original frame
+    alpha = 0.3
+    cv2.addWeighted(overlay, alpha, display_frame, 1-alpha, 0, display_frame)
     return display_frame
 
-def lane_from_x(x, y=None, frame_width=640, frame_height=480):
-    """Return the token's lane OFFSET relative to the front-camera centre.
 
-    Important: this is not an absolute road lane. The camera follows the car,
-    so a token directly ahead remains offset 0 even when the car is physically
-    in lane -2, -1, +1 or +2. Use absolute_lane_for_token() in the planner.
-    """
+def lane_from_x(x, y=None, frame_width=640, frame_height=480):
     # If y is not provided, fallback to the old simple split method
     if y is None:
         lane_count = 5
@@ -685,257 +499,133 @@ def lane_from_x(x, y=None, frame_width=640, frame_height=480):
         return 2
 
 
-def clamp_lane(lane):
-    """Clamp one absolute road-lane index to the valid five-lane range."""
-    return max(-2, min(2, int(lane)))
-
-
-def relative_lane_for_token(token, frame_width, frame_height):
-    """Return a token's lane offset relative to the vehicle-mounted camera."""
-    return lane_from_x(
-        token['x'], token['y'],
-        frame_width=frame_width,
-        frame_height=frame_height
-    )
-
-
-def absolute_lane_for_token(token, current_vehicle_lane, frame_width, frame_height):
-    """Convert a camera-relative token offset into an absolute road lane.
-
-    This conversion fixes the main control bug visible in the recorded run:
-    the previous planner compared relative token offsets with absolute vehicle
-    lanes, causing it to continue steering toward red and yellow tokens.
+def detect_trailing_and_police(back_frame):
     """
-    relative_lane = relative_lane_for_token(token, frame_width, frame_height)
-    return clamp_lane(current_vehicle_lane + relative_lane)
+    Robust vision-based detection using the back camera frame.
+    - trailing_detected: True when a large moving object is detected directly behind the player in a constrained ROI.
+    - police_detected: True when bright neon red+blue lights are detected horizontally aligned in the back camera.
 
-
-def calculate_token_distance(token, frame_width, frame_height):
+    Returns: (trailing_detected(bool), police_detected(bool), largest_area(float), largest_bbox(tuple|None))
     """
-    Estimate the token's distance from the car in normalised image space.
+    if back_frame is None:
+        return False, False, 0.0, None
 
-    This is not a distance in metres. A calibrated homography would be needed
-    for metric ground-plane distance. For target ranking and steering control,
-    normalised image-space distance is sufficient and more robust than raw
-    pixel distance across different resolutions.
-    """
-    pickup_x = frame_width * CAR_PICKUP_X_RATIO
-    pickup_y = frame_height * TOKEN_COLLECTION_Y_RATIO
+    frame_h, frame_w = back_frame.shape[:2]
 
-    lateral_error_ratio = (token['x'] - pickup_x) / max(frame_width / 2.0, 1.0)
-    remaining_y_ratio = (pickup_y - token['y']) / max(float(frame_height), 1.0)
-    remaining_y_ratio = max(0.0, remaining_y_ratio)
+    # --- 1. Trailing Car Detection (Constrained ROI) ---
+    # We only look at the center lane directly behind us to ignore the fast-moving scenery on the sides.
+    # X: 35% to 65% of width, Y: 40% to 90% of height.
+    t_roi_x1 = int(frame_w * 0.35)
+    t_roi_x2 = int(frame_w * 0.65)
+    t_roi_y1 = int(frame_h * 0.40)
+    t_roi_y2 = int(frame_h * 0.90)
 
-    image_distance = float(np.hypot(lateral_error_ratio, remaining_y_ratio))
-    return {
-        'image_distance': image_distance,
-        'lateral_error_ratio': float(lateral_error_ratio),
-        'remaining_y_ratio': float(remaining_y_ratio),
-        'pickup_x': float(pickup_x),
-        'pickup_y': float(pickup_y)
-    }
+    t_roi = back_frame[t_roi_y1:t_roi_y2, t_roi_x1:t_roi_x2]
+    gray_roi = cv2.cvtColor(t_roi, cv2.COLOR_BGR2GRAY)
+    gray_roi = cv2.GaussianBlur(gray_roi, (7, 7), 0)
 
+    with data_lock:
+        prev_gray_roi = shared_data.get('back_prev_gray')
+        prev_area = shared_data.get('back_prev_area', 0.0)
 
-def evaluate_token_candidate(token, current_vehicle_lane, frame_width, frame_height):
-    """
-    Add lane-gap, reachability, and distance information to one detected token.
+    largest_area = 0.0
+    largest_bbox = None
+    trailing = False
 
-    A lane change is considered feasible only when enough vertical image-space
-    travel remains before the token reaches the collection line. This prevents
-    the controller from starting an impossible late lane change.
-    """
-    relative_lane = relative_lane_for_token(token, frame_width, frame_height)
-    lane = absolute_lane_for_token(
-        token, current_vehicle_lane, frame_width, frame_height
-    )
-    lane_gap = abs(lane - current_vehicle_lane)
-    metrics = calculate_token_distance(token, frame_width, frame_height)
+    if prev_gray_roi is not None and prev_gray_roi.shape == gray_roi.shape:
+        # Frame differencing purely inside the safe ROI
+        diff = cv2.absdiff(prev_gray_roi, gray_roi)
+        _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((5, 5), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-    required_margin = GREEN_REACHABILITY_BASE_MARGIN + lane_gap * LANE_CHANGE_TIME_Y_RATIO
-    reachable = lane_gap == 0 or metrics['remaining_y_ratio'] >= required_margin
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Tokens lying on the ground appear as very wide, flat objects when they pass under the car.
+            # A trailing car is a 3D object and will have a much taller bounding box.
+            aspect_ratio = float(w) / h if h > 0 else 0.0
+            
+            # Filter out flat objects (tokens) and require a minimum physical height in the ROI
+            if aspect_ratio < 2.5 and h > (t_roi_y2 - t_roi_y1) * 0.15:
+                if area > largest_area:
+                    largest_area = area
+                    # Offset bounding box back to original frame coordinates
+                    largest_bbox = (x + t_roi_x1, y + t_roi_y1, w, h)
 
-    # Prefer the next reachable token, while slightly penalising risky long
-    # cross-lane movements and large lateral errors.
-    progress_ratio = token['y'] / max(float(frame_height), 1.0)
-    route_score = (
-        progress_ratio * 3.0
-        - lane_gap * 0.16
-        - abs(metrics['lateral_error_ratio']) * 0.08
-    )
+        # Minimum threshold for an approaching car within this ROI (around 6000 pixels to ignore small tokens)
+        TRAILING_MOTION_AREA_MIN_ROI = 6000
+        TRAILING_APPROACH_RATIO = 1.05  # slightly more forgiving since ROI is smaller
 
-    return {
-        'token': dict(token),
-        'lane': lane,
-        'relative_lane': relative_lane,
-        'lane_gap': lane_gap,
-        'color': token.get('color'),
-        'y': token['y'],
-        'reachable': reachable,
-        'route_score': float(route_score),
-        **metrics
-    }
+        if largest_area > TRAILING_MOTION_AREA_MIN_ROI:
+            if prev_area > 0 and largest_area > (prev_area * TRAILING_APPROACH_RATIO):
+                trailing = True
 
+    # --- 2. Police Detection (Bright Neon Color Filters) ---
+    # Police cars have bright lightbars. We look at the upper-middle section.
+    p_roi_x1 = int(frame_w * 0.20)
+    p_roi_x2 = int(frame_w * 0.80)
+    p_roi_y1 = int(frame_h * 0.30)
+    p_roi_y2 = int(frame_h * 0.70)
+    
+    p_roi = back_frame[p_roi_y1:p_roi_y2, p_roi_x1:p_roi_x2]
+    hsv_roi = cv2.cvtColor(p_roi, cv2.COLOR_BGR2HSV)
 
+    # Use very strict Saturation (>180) and Value (>200) thresholds to ignore dull environmental colors
+    lower_red1 = np.array([0, 180, 200])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 180, 200])
+    upper_red2 = np.array([180, 255, 255])
+    
+    lower_blue = np.array([100, 180, 200])
+    upper_blue = np.array([140, 255, 255])
 
-def lane_has_imminent_hazard(lane, tokens, current_vehicle_lane,
-                             frame_width, frame_height,
-                             minimum_progress=UNWANTED_TOKEN_AVOID_Y_RATIO):
-    """Return True if a visible red, yellow or hidden token threatens a lane."""
-    for token in tokens:
-        color = get_visible_color(token)
-        if color not in ['yellow', 'red', 'hidden']:
-            continue
+    red_mask1 = cv2.inRange(hsv_roi, lower_red1, upper_red1)
+    red_mask2 = cv2.inRange(hsv_roi, lower_red2, upper_red2)
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+    blue_mask = cv2.inRange(hsv_roi, lower_blue, upper_blue)
 
-        token_lane = absolute_lane_for_token(
-            token, current_vehicle_lane, frame_width, frame_height
-        )
-        progress = token['y'] / max(float(frame_height), 1.0)
-        if token_lane == lane and progress >= minimum_progress:
-            return True
+    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blue_contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    return False
+    police = False
+    POLICE_MIN_BRIGHT_AREA = 100
 
+    red_centers = []
+    for cnt in red_contours:
+        if cv2.contourArea(cnt) > POLICE_MIN_BRIGHT_AREA:
+            x, y, w, h = cv2.boundingRect(cnt)
+            red_centers.append((x + w/2.0, y + h/2.0))
 
-def lane_has_blocking_hazard(target_candidate, tokens, current_vehicle_lane,
-                             frame_width, frame_height):
-    """
-    Apply a hard veto if a visible hazard blocks the route to a green target.
+    blue_centers = []
+    for cnt in blue_contours:
+        if cv2.contourArea(cnt) > POLICE_MIN_BRIGHT_AREA:
+            x, y, w, h = cv2.boundingRect(cnt)
+            blue_centers.append((x + w/2.0, y + h/2.0))
 
-    The corridor includes intermediate absolute lanes because the car may need
-    to cross them before reaching the intended green-token lane.
-    """
-    target_lane = target_candidate['lane']
-    target_y = target_candidate['y']
-    margin = frame_height * HAZARD_BLOCK_Y_MARGIN_RATIO
-    corridor_lanes = set(range(
-        min(current_vehicle_lane, target_lane),
-        max(current_vehicle_lane, target_lane) + 1
-    ))
+    if red_centers and blue_centers:
+        # Check if the bright red and blue lights are horizontally aligned (lightbar on top of the car)
+        # Max horizontal distance and max vertical distance
+        max_x_dist = frame_w * 0.40
+        max_y_dist = frame_h * 0.10  # They should be relatively on the same horizontal plane
 
-    for token in tokens:
-        color = get_visible_color(token)
-        if color not in ['yellow', 'red', 'hidden']:
-            continue
+        for rx, ry in red_centers:
+            for bx, by in blue_centers:
+                if abs(rx - bx) <= max_x_dist and abs(ry - by) <= max_y_dist:
+                    police = True
+                    break
+            if police:
+                break
 
-        token_lane = absolute_lane_for_token(
-            token, current_vehicle_lane, frame_width, frame_height
-        )
-        if token_lane not in corridor_lanes:
-            continue
+    # Save state for next frame
+    with data_lock:
+        shared_data['back_prev_gray'] = gray_roi
+        shared_data['back_prev_area'] = largest_area
 
-        # Larger y values are closer to the car. Reject routes where the hazard
-        # is already in front of, or close behind, the intended green token.
-        if token['y'] >= target_y - margin:
-            return True
-
-    return False
-
-
-def choose_emergency_escape_lane(tokens, current_vehicle_lane,
-                                 frame_width, frame_height):
-    """Choose one adjacent escape lane when the current lane is dangerous.
-
-    An emergency manoeuvre is limited to one lane at a time. This avoids a
-    risky multi-lane sweep through a token row while still leaving the current
-    hazardous lane as early as possible.
-    """
-    candidate_lanes = [
-        lane for lane in (
-            current_vehicle_lane - 1,
-            current_vehicle_lane + 1,
-            current_vehicle_lane
-        )
-        if -2 <= lane <= 2
-    ]
-    return choose_low_risk_lane(
-        tokens, current_vehicle_lane, frame_width, frame_height,
-        candidate_lanes=candidate_lanes
-    )
-
-
-def choose_low_risk_lane(tokens, current_vehicle_lane, frame_width, frame_height,
-                         candidate_lanes=None):
-    """Choose a safe lane when no confirmed and reachable green route exists."""
-    if candidate_lanes is None:
-        candidate_lanes = list(range(-2, 3))
-
-    best_lane = current_vehicle_lane
-    best_score = -float('inf')
-
-    for lane in candidate_lanes:
-        lane = max(-2, min(2, lane))
-        score = -abs(lane - current_vehicle_lane) * LANE_SWITCH_PENALTY
-
-        for token in tokens:
-            color = get_visible_color(token)
-            if color not in ['green', 'yellow', 'red', 'hidden']:
-                continue
-
-            token_lane = absolute_lane_for_token(
-                token, current_vehicle_lane, frame_width, frame_height
-            )
-            if token_lane != lane:
-                continue
-
-            progress = token['y'] / max(float(frame_height), 1.0)
-            proximity_weight = 1.0 + 4.0 * progress * progress
-
-            if color == 'green' and token.get('hits', 1) >= GREEN_CONFIRM_FRAMES:
-                score += GREEN_LANE_REWARD * proximity_weight
-            elif progress >= UNWANTED_TOKEN_AVOID_Y_RATIO:
-                if color == 'yellow':
-                    score -= YELLOW_HAZARD_PENALTY * proximity_weight
-                elif color == 'red':
-                    score -= RED_HAZARD_PENALTY * proximity_weight
-                elif color == 'hidden':
-                    score -= UNKNOWN_HAZARD_PENALTY * proximity_weight
-
-        if score > best_score:
-            best_score = score
-            best_lane = lane
-
-    return best_lane
-
-def select_best_green_candidate(candidates, tokens, current_vehicle_lane,
-                                frame_width, frame_height):
-    """Select the best confirmed green route using only currently visible types."""
-    if not candidates:
-        return None
-
-    lane_scores = {}
-    for lane in range(-2, 3):
-        score = -abs(lane - current_vehicle_lane) * LANE_SWITCH_PENALTY
-        for token in tokens:
-            color = get_visible_color(token)
-            if color not in ['green', 'yellow', 'red', 'hidden']:
-                continue
-
-            token_lane = absolute_lane_for_token(
-                token, current_vehicle_lane, frame_width, frame_height
-            )
-            if token_lane != lane:
-                continue
-
-            progress = token['y'] / max(float(frame_height), 1.0)
-            proximity_weight = 1.0 + 4.0 * progress * progress
-            if color == 'green' and token.get('hits', 1) >= GREEN_CONFIRM_FRAMES:
-                score += GREEN_LANE_REWARD * proximity_weight
-            elif progress >= UNWANTED_TOKEN_AVOID_Y_RATIO:
-                if color == 'yellow':
-                    score -= YELLOW_HAZARD_PENALTY * proximity_weight
-                elif color == 'red':
-                    score -= RED_HAZARD_PENALTY * proximity_weight
-                elif color == 'hidden':
-                    score -= UNKNOWN_HAZARD_PENALTY * proximity_weight
-        lane_scores[lane] = score
-
-    return max(
-        candidates,
-        key=lambda candidate: (
-            lane_scores.get(candidate['lane'], -float('inf')),
-            candidate['route_score']
-        )
-    )
+    return trailing, police, largest_area, largest_bbox
 
 def get_active_yellow_effect():
     now = time.time()
@@ -959,12 +649,6 @@ def start_random_yellow_effect():
             shared_data['hidden_next_token_type'] = True
 
 def maybe_record_collected_token(tokens, frame_width, frame_height):
-    """
-    Estimate collection only when a tracked token crosses the pickup line.
-
-    Track IDs avoid double counting a persistent contour and avoid suppressing a
-    genuinely new token that appears shortly afterwards in the same lane.
-    """
     global locked_green_lane, locked_green_until
 
     now = time.time()
@@ -972,25 +656,26 @@ def maybe_record_collected_token(tokens, frame_width, frame_height):
     collected = None
 
     for token in tokens:
-        previous_y = token.get('previous_y', token['y'])
-        crossed_collection_line = previous_y < collection_y <= token['y']
-        if not crossed_collection_line:
+        if token['y'] < collection_y:
             continue
 
-        relative_lane = relative_lane_for_token(token, frame_width, frame_height)
-        if relative_lane != 0:
+        token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
+        if token_lane != current_lane:
             continue
 
-        color = get_actual_color(token)
+        color = token.get('true_color', token.get('color'))
         if color not in ['green', 'yellow', 'red']:
             continue
 
-        token_id = f"track:{token.get('track_id', relative_lane)}"
+        token_id = f"{token_lane}:{color}"
+
         with data_lock:
             recent_collections = shared_data.get('last_collected_by_lane_color', {})
-            already_counted = token_id in recent_collections
+            recent_same_token = (
+                now - recent_collections.get(token_id, 0.0) < TOKEN_COLLECTION_COOLDOWN_SECONDS
+            )
 
-        if already_counted:
+        if recent_same_token:
             continue
 
         collected = (token_id, color)
@@ -1082,390 +767,271 @@ def send_control_packet(steering_input, acceleration_input):
     control_conn.sendall(delayed_data)
 
 def processing_task():
-    """
-    Detect tokens from each new front-camera frame and display both previews.
-
-    The back-camera frame remains a live preview only. Tracking is updated only
-    once per new front frame so hit counts represent real observations rather
-    than repeated processing-loop iterations.
-    """
-    global last_processed_front_seq
-
+    #This is where you write your image processing code to decide how to control the car
+    #You can use libraries like OpenCV to process the image
+    #There is no limtation to the complexity of the processing task, you can use any libraries you want
+    #Remember to use the shared_data to get the latest frame
     with data_lock:
-        front_frame = shared_data.get('latest_front_frame')
+        front_frame = shared_data['latest_front_frame']
+    
+    with data_lock:
         back_frame = shared_data.get('latest_back_frame')
-        front_frame_seq = shared_data.get('front_frame_seq', 0)
 
-    window_updated = False
+    if front_frame is not None:
+        processed_front_frame = apply_camera_effects(front_frame)
+        tokens = detect_colored_tokens(processed_front_frame)
+        tokens = apply_token_visibility_effects(tokens)
 
-    if back_frame is not None:
-        try:
-            back_debug_frame = back_frame.copy()
-            cv2.putText(
-                back_debug_frame, 'Back Camera Preview', (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
-            )
-            cv2.imshow('Back Camera', cv2.resize(back_debug_frame, (640, 480)))
-            window_updated = True
-        except Exception as e:
-            print(f'Back camera display error: {e}')
+        with data_lock:
+            shared_data['detected_tokens'] = tokens
 
-    if front_frame is not None and front_frame_seq != last_processed_front_seq:
-        try:
-            last_processed_front_seq = front_frame_seq
-            processed_front_frame = apply_camera_effects(front_frame)
-
-            tokens = detect_colored_tokens(processed_front_frame)
-            tokens = apply_token_visibility_effects(tokens)
-            tokens = update_token_tracks(
-                tokens,
-                processed_front_frame.shape[1],
-                processed_front_frame.shape[0]
-            )
-
-            with data_lock:
-                shared_data['detected_tokens'] = tokens
-
-            debug_frame = draw_detected_tokens(processed_front_frame, tokens)
-
-            with data_lock:
-                decision_text = shared_data.get('decision_debug', '')
-                target_debug = shared_data.get('target_token_debug')
-
-            if decision_text:
-                cv2.putText(
-                    debug_frame, decision_text, (10, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2
-                )
-
-            if target_debug is not None:
-                target_token = target_debug.get('token', {})
-                tx = int(target_token.get('x', 0))
-                ty = int(target_token.get('y', 0))
-                cv2.circle(debug_frame, (tx, ty), 10, (255, 255, 255), 2)
-                cv2.putText(
-                    debug_frame,
-                    f"TARGET D={target_debug.get('image_distance', 0.0):.3f}",
-                    (max(tx - 85, 0), max(ty - 24, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2
-                )
-
-            effect = get_active_yellow_effect()
-            if effect:
-                cv2.putText(
-                    debug_frame, f'Yellow Effect: {effect}', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
-                )
-
-            cv2.imshow('Front Camera', cv2.resize(debug_frame, (640, 480)))
-            window_updated = True
-        except Exception as e:
-            print(f'Front camera processing error: {e}')
-
-    if window_updated:
+        debug_frame = draw_detected_tokens(processed_front_frame, tokens)
+        effect = get_active_yellow_effect()
+        if effect:
+            cv2.putText(debug_frame, f"Yellow Effect: {effect}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        debug_frame = cv2.resize(debug_frame, (640, 480))
+        cv2.imshow("Front Camera", debug_frame)
         cv2.waitKey(1)
 
-# Global variables for strict tap-based lane changes
-# Sequence for each one-lane movement:
-#   PRE_TAP_NEUTRAL (0.0) -> TAP_ACTIVE (+/-1.0) -> RESET_NEUTRAL (0.0)
-TAP_IDLE = 0
-TAP_PRE_TAP_NEUTRAL = 1
-TAP_ACTIVE = 2
-TAP_RESET_NEUTRAL = 3
+    # Run trailing / police detection on back camera
+    if back_frame is not None:
+        trailing, police, area, bbox = detect_trailing_and_police(back_frame)
+        with data_lock:
+            shared_data['trailing_detected'] = trailing
+            shared_data['police_detected'] = police
+            shared_data['danger_detected'] = trailing or False
+            
+            if police:
+                shared_data['run_summary']['police_appeared'] = True
+            if trailing:
+                shared_data['run_summary']['trailing_appeared'] = True
 
-steering_state = TAP_IDLE
-tap_loop_count = 0
-tap_direction = 0.0
-current_lane = START_LANE
-last_token_lane = None
+        # Show the rear view in the same window, with detection overlays on top.
+        try:
+            dbg = back_frame.copy()
+            if bbox is not None and trailing:
+                x, y, w, h = bbox
+                cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 255, 255), 2)
+
+            status_color = (0, 255, 0)
+            if trailing:
+                status_color = (0, 255, 255)
+            if police:
+                status_color = (0, 0, 255)
+
+            lines = [
+                "Back Camera",
+                f"Trailing: {trailing}",
+                f"Police: {police}",
+                f"Area: {int(area)}"
+            ]
+            for idx, line in enumerate(lines):
+                cv2.putText(dbg, line, (10, 30 + idx * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+            dbg = cv2.resize(dbg, (640, 480))
+            cv2.imshow("Back Camera", dbg)
+            cv2.waitKey(1)
+        except Exception:
+            pass
+
+# def send_controls_task():
+#     #This is where you send the control commands to the car using the control_conn
+#     global control_conn
+#     if control_conn is None:
+#         return
+    
+#     #these are the variables used to control the car
+#     #steering_input: -1.0 to 1.0 (left to right)
+#     #acceleration_input: -1.0 to 1.0 (reverse to forward)
+#     #this example always accelerate forward
+#     steering_input = 0.0
+#     acceleration_input = 1.0
+
+#     try:
+#         # Pack and send the control command
+#         data = struct.pack('ff', steering_input, acceleration_input)
+#         control_conn.sendall(data)
+#     except Exception as e:
+#         print(f"Control send error: {e}")
+#         control_conn = None
+# Global variables to track our steering state machine
+steering_state = 0       # 0 = Idle, 1 = Tapping, 2 = Resetting
+tap_loop_count = 0       # Counts how many loops we hold the steering wheel
+current_lane = START_LANE # Tracks our car's actual lane position (-2, -1, 0, 1, 2)
+last_token_lane = None   # Keeps the last good token decision when tokens briefly disappear
 last_token_time = 0.0
 locked_green_lane = None
 locked_green_until = 0.0
 run_start_time = None
-
-
 def send_controls_task():
-    """
-    Choose a token lane and send tap-based steering commands only.
-
-    Steering output is deliberately restricted to -1.0, 0.0, or +1.0.
-    No proportional steering or continuous fine-alignment command is used.
-    """
-    global control_conn
-    global steering_state, tap_loop_count, tap_direction, current_lane
-    global last_token_lane, last_token_time, locked_green_lane, locked_green_until
-    global run_start_time
-
+    global control_conn, steering_state, tap_loop_count, current_lane, last_token_lane, last_token_time, locked_green_lane, locked_green_until, run_start_time
+    
     if control_conn is None:
         return
-
+    
     with data_lock:
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
         front_frame = shared_data.get('latest_front_frame')
-        front_frame_time = shared_data.get('front_frame_time', 0.0)
-        run_summary = dict(shared_data.get('run_summary', {}))
+        run_summary = shared_data.get('run_summary', {})
+        green_streak = run_summary.get('green_collected', 0)
+        red_streak = run_summary.get('red_collected', 0)
 
     steering_input = 0.0
-    acceleration_input = CAR_ACCELERATION
+    acceleration_input = CAR_ACCELERATION 
 
     if run_start_time is not None and time.time() - run_start_time < START_CENTER_HOLD_SECONDS:
-        try:
-            send_control_packet(0.0, 0.0)
-        except Exception:
-            pass
+        try: control_conn.sendall(struct.pack('ff', 0.0, 0.0))
+        except Exception: pass
         current_lane = START_LANE
         return
 
-    img_w, img_h = (
-        (front_frame.shape[1], front_frame.shape[0])
-        if front_frame is not None else (640, 480)
-    )
-
-    # Do not chase stale perception after a camera interruption.
-    if (
-        front_frame is None
-        or front_frame_time <= 0.0
-        or time.monotonic() - front_frame_time > STALE_FRONT_FRAME_SECONDS
-    ):
-        with data_lock:
-            shared_data['decision_debug'] = 'Reason: STALE_FRONT_FRAME | Hold lane safely'
-            shared_data['target_token_debug'] = None
-        try:
-            send_control_packet(0.0, 0.30)
-        except Exception:
-            pass
-        return
-
+    img_w, img_h = (front_frame.shape[1], front_frame.shape[0]) if front_frame is not None else (640, 480)
     maybe_record_collected_token(tokens_snapshot, img_w, img_h)
 
-    green_collected = run_summary.get('green_collected', 0)
-    red_collected = run_summary.get('red_collected', 0)
+    with data_lock:
+        run_summary = shared_data.get('run_summary', {})
+        green_streak = run_summary.get('green_collected', 0)
+        red_streak = run_summary.get('red_collected', 0)
 
-    # Local estimate only. The simulator remains the source of truth.
-    estimated_speed_modifier = 1.0 + green_collected * 0.10 - red_collected * 0.20
+    # =========================================================
+    # 1. SPEED MODIFIER & TUNING PARAMETERS
+    # =========================================================
+    estimated_speed_modifier = 1.0 + (green_streak * 0.10) - (red_streak * 0.20)
     estimated_speed_modifier = max(0.5, min(2.5, estimated_speed_modifier))
     acceleration_input = max(0.25, min(1.0, CAR_ACCELERATION * estimated_speed_modifier))
 
-    # Preserve tap semantics while allowing a modest duration adjustment as the
-    # simulated speed changes.
-    adaptive_pre_tap_loops = max(
-        1, int(LANE_CHANGE_PRE_TAP_LOOPS / (estimated_speed_modifier ** 0.25))
-    )
-    adaptive_tap_loops = max(
-        8, int(LANE_CHANGE_TAP_LOOPS / (estimated_speed_modifier ** 0.25))
-    )
-    adaptive_reset_loops = max(
-        2, int(LANE_CHANGE_RESET_LOOPS / (estimated_speed_modifier ** 0.25))
-    )
+    # Calculate adaptive state machine loops based on velocity.
+    adaptive_tap_loops = max(10, int(LANE_CHANGE_TAP_LOOPS / (estimated_speed_modifier ** 0.25)))
+    adaptive_reset_loops = max(1, int(LANE_CHANGE_RESET_LOOPS / (estimated_speed_modifier ** 0.25)))
 
-    # Detect all colours, but only green tokens become collection candidates.
-    evaluated_tokens = []
-    green_candidates = []
-    for token in tokens_snapshot:
-        # Lane planning must use the currently visible type only. A token whose
-        # type was hidden by a yellow effect is treated as an unknown hazard.
-        color = get_visible_color(token)
-        if color not in ['green', 'yellow', 'red', 'hidden']:
+    # =========================================================
+    # 2. TOKEN PRIORITY CLASSIFICATION
+    # =========================================================
+    token_priority = {'yellow': 2, 'red': 1}
+    best_green = None
+    best_backup_token = None
+
+    for t in tokens_snapshot:
+        t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
+        t_lane = max(-2, min(2, t_lane))
+        color = t.get('color')
+
+        if color not in ['green', 'yellow', 'red']:
             continue
 
-        candidate = evaluate_token_candidate(
-            token, current_lane, img_w, img_h
-        )
-        candidate['color'] = color
-        evaluated_tokens.append(candidate)
+        # Decide early, when the token is still far enough away to reach.
+        if t['y'] < TOKEN_DECISION_Y_MIN:
+            continue
 
-        if (
-            color == 'green'
-            and token.get('hits', 1) >= GREEN_CONFIRM_FRAMES
-            and token['y'] >= TOKEN_DECISION_Y_MIN
-            and candidate['reachable']
-        ):
-            green_candidates.append(candidate)
+        candidate = {
+            'lane': t_lane,
+            'y': t['y'],
+            'color': color,
+            'score': 3 if color == 'green' else token_priority[color]
+        }
 
-    # A green reward never overrides a red, yellow or unknown token blocking
-    # the driving corridor. This is a hard safety veto rather than a soft score.
-    green_candidates = [
-        candidate for candidate in green_candidates
-        if not lane_has_blocking_hazard(
-            candidate, tokens_snapshot, current_lane, img_w, img_h
-        )
-    ]
+        if color == 'green':
+            if best_green is None or candidate['y'] < best_green['y']:
+                best_green = candidate
+        elif best_backup_token is None:
+            best_backup_token = candidate
+        elif candidate['score'] > best_backup_token['score']:
+            best_backup_token = candidate
+        elif candidate['score'] == best_backup_token['score'] and candidate['y'] < best_backup_token['y']:
+            best_backup_token = candidate
 
-    # Yellow-token effects can make perception or actuation unreliable. Reduce
-    # speed while an effect is active so the controller has more reaction time.
-    active_yellow_effect = get_active_yellow_effect()
-    if active_yellow_effect is not None:
-        acceleration_input = min(acceleration_input, YELLOW_EFFECT_SAFE_ACCELERATION)
-
-    # Safety always overrides collection. Start leaving a hazardous lane before
-    # the token reaches the old late threshold, even if a green is also visible.
-    current_lane_hazard = lane_has_imminent_hazard(
-        current_lane,
-        tokens_snapshot,
-        current_lane,
-        img_w,
-        img_h,
-        minimum_progress=UNWANTED_TOKEN_AVOID_Y_RATIO
-    )
-    current_lane_emergency = lane_has_imminent_hazard(
-        current_lane,
-        tokens_snapshot,
-        current_lane,
-        img_w,
-        img_h,
-        minimum_progress=EMERGENCY_HAZARD_Y_RATIO
-    )
-
+    # =========================================================
+    # 3. GREEN-FIRST TARGET DECISION
+    # =========================================================
     chosen_target_lane = None
-    active_green_candidate = None
-    decision_reason = 'MAINTAIN_SAFE_LANE'
+    decision_reason = "MAINTAIN"
+
     now = time.time()
 
-    # A visible hazard in the current lane overrides green collection and stale
-    # green memory. The emergency branch chooses only one adjacent move.
-    if current_lane_hazard:
-        chosen_target_lane = choose_emergency_escape_lane(
-            tokens_snapshot, current_lane, img_w, img_h
-        )
-        locked_green_lane = None
-        locked_green_until = 0.0
-        last_token_lane = None
-        last_token_time = 0.0
-        acceleration_input = min(
-            acceleration_input,
-            EMERGENCY_BRAKE_ACCELERATION
-            if current_lane_emergency
-            else EMERGENCY_ESCAPE_ACCELERATION
-        )
-        decision_reason = (
-            'EMERGENCY_ESCAPE'
-            if chosen_target_lane != current_lane
-            else 'BRAKE_FOR_HAZARD'
-        )
-
-    # Retain a short lock to prevent rapid lane oscillation, but allow a new
-    # visible green to replace a stale lock immediately.
-    if chosen_target_lane is None and locked_green_lane is not None and now < locked_green_until:
-        same_lane_greens = [
-            candidate for candidate in green_candidates
-            if candidate['lane'] == locked_green_lane
-        ]
-        active_green_candidate = select_best_green_candidate(
-            same_lane_greens, tokens_snapshot, current_lane, img_w, img_h
-        )
-
-    if chosen_target_lane is None and active_green_candidate is None:
-        active_green_candidate = select_best_green_candidate(
-            green_candidates, tokens_snapshot, current_lane, img_w, img_h
-        )
-
-    if chosen_target_lane is None and active_green_candidate is not None:
-        chosen_target_lane = active_green_candidate['lane']
+    if best_green is not None:
+        chosen_target_lane = best_green['lane']
         locked_green_lane = chosen_target_lane
         locked_green_until = now + GREEN_TARGET_LOCK_SECONDS
+        decision_reason = "COLLECT_GREEN"
         last_token_lane = chosen_target_lane
         last_token_time = now
-        decision_reason = 'COLLECT_GREEN'
-    elif chosen_target_lane is None and (
-        last_token_lane is not None
-        and now - last_token_time < TOKEN_TARGET_MEMORY_SECONDS
-        and not lane_has_imminent_hazard(
-            last_token_lane, tokens_snapshot, current_lane, img_w, img_h
-        )
-    ):
-        # Brief memory prevents a lane change from being aborted by one missed
-        # contour, but a newly visible hazard always cancels stale green memory.
-        chosen_target_lane = last_token_lane
-        decision_reason = 'GREEN_MEMORY'
-    elif chosen_target_lane is None:
-        chosen_target_lane = choose_low_risk_lane(
-            tokens_snapshot, current_lane, img_w, img_h
-        )
-        decision_reason = (
-            'AVOID_RED_YELLOW'
-            if chosen_target_lane != current_lane
-            else 'MAINTAIN_SAFE_LANE'
-        )
+    elif locked_green_lane is not None and now < locked_green_until:
+        chosen_target_lane = locked_green_lane
+        decision_reason = "GREEN_LOCK"
+    elif best_backup_token is not None:
+        chosen_target_lane = best_backup_token['lane']
+        decision_reason = f"COLLECT_{best_backup_token['color'].upper()}"
+        last_token_lane = chosen_target_lane
+        last_token_time = now
 
-    chosen_target_lane = clamp_lane(chosen_target_lane)
-    with data_lock:
-        shared_data['target_lane'] = chosen_target_lane
+    # Memory Fallback: Prevent aborting mid-maneuver due to camera sensor noise
+    if chosen_target_lane is None and last_token_lane is not None:
+        if now - last_token_time < TOKEN_TARGET_MEMORY_SECONDS:
+            chosen_target_lane = last_token_lane
+            decision_reason = "TOKEN_MEMORY"
 
-    # Strict tap state machine. Each one-lane move always includes a neutral
-    # period before and after the +/-1.0 steering pulse.
-    if steering_state == TAP_IDLE:
-        steering_input = 0.0
+    # Baseline Strategy
+    if chosen_target_lane is None:
+        chosen_target_lane = current_lane
+
+    # =========================================================
+    # 4. STEPPING CONTROL MOTOR ENGINE
+    # =========================================================
+    if decision_reason in ["COLLECT_GREEN", "GREEN_LOCK"]:
+        with data_lock:
+            if shared_data['target_lane'] != chosen_target_lane:
+                shared_data['target_lane'] = chosen_target_lane
+
+    if steering_state == 0:
         if chosen_target_lane != current_lane:
-            steering_state = TAP_PRE_TAP_NEUTRAL
+            steering_state = 1
             tap_loop_count = 0
+            with data_lock:
+                shared_data['target_lane'] = chosen_target_lane
 
-    elif steering_state == TAP_PRE_TAP_NEUTRAL:
-        steering_input = 0.0
-        tap_loop_count += 1
-        if tap_loop_count >= adaptive_pre_tap_loops:
-            tap_loop_count = 0
-            if chosen_target_lane == current_lane:
-                steering_state = TAP_IDLE
-            else:
-                tap_direction = 1.0 if chosen_target_lane > current_lane else -1.0
-                steering_state = TAP_ACTIVE
+    elif steering_state == 1:
+        with data_lock:
+            tgt_lane = shared_data['target_lane']
 
-    elif steering_state == TAP_ACTIVE:
-        steering_input = tap_direction
-        acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
-        tap_loop_count += 1
-        if tap_loop_count >= adaptive_tap_loops:
-            tap_loop_count = 0
-            current_lane = max(-2, min(2, current_lane + int(tap_direction)))
-            steering_state = TAP_RESET_NEUTRAL
+        if tgt_lane == current_lane:
+            steering_state = 0
+            steering_input = 0.0
+        else:
+            steering_input = 1.0 if tgt_lane > current_lane else -1.0
+            
+            lane_gap = abs(tgt_lane - current_lane)
 
-    elif steering_state == TAP_RESET_NEUTRAL:
+            # Drop acceleration more for long cross-lane moves so the car has time to slide across.
+            acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION - (0.12 if lane_gap >= 3 else 0.06))
+            
+            tap_loop_count += 1
+            if tap_loop_count >= adaptive_tap_loops:
+                steering_state = 2
+                tap_loop_count = 0
+                current_lane = max(-2, min(2, current_lane + (1 if tgt_lane > current_lane else -1)))
+
+    elif steering_state == 2:
         steering_input = 0.0
         tap_loop_count += 1
         if tap_loop_count >= adaptive_reset_loops:
             tap_loop_count = 0
-            tap_direction = 0.0
-            steering_state = TAP_IDLE
+            with data_lock:
+                tgt_lane = shared_data['target_lane']
+            steering_state = 1 if tgt_lane != current_lane else 0
 
-    target_debug = None
-    debug_suffix = ''
-    if active_green_candidate is not None:
-        target_debug = dict(active_green_candidate)
-        debug_suffix = (
-            f" | Dist: {active_green_candidate['image_distance']:.3f}"
-            f" | RemY: {active_green_candidate['remaining_y_ratio']:.3f}"
-            f" | Rel: {active_green_candidate.get('relative_lane', 0):+d}"
-        )
-
-    state_names = {
-        TAP_IDLE: 'IDLE',
-        TAP_PRE_TAP_NEUTRAL: 'PRE_NEUTRAL',
-        TAP_ACTIVE: 'TAP',
-        TAP_RESET_NEUTRAL: 'RESET_NEUTRAL'
-    }
     with data_lock:
-        shared_data['steering_input'] = steering_input
-        shared_data['acceleration_input'] = acceleration_input
-        shared_data['decision_debug'] = (
-            f"Reason: {decision_reason} | GoTo: {chosen_target_lane}"
-            f" | Lane: {current_lane} | TapState: {state_names[steering_state]}"
-            f"{debug_suffix}"
-        )
-        shared_data['target_token_debug'] = target_debug
+        shared_data['decision_debug'] = f"Reason: {decision_reason} | GoTo: {chosen_target_lane}"
 
     try:
         send_control_packet(steering_input, acceleration_input)
-    except Exception as exc:
-        print(f"Network error: {exc}")
+    except Exception as e:
+        print(f"Network error: {e}")
         control_conn = None
-
 #---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
 if __name__ == '__main__':
-    token_tracks.clear()
-    next_token_track_id = 1
-    last_processed_front_seq = -1
     current_lane = START_LANE
     steering_state = 0
     tap_loop_count = 0
@@ -1479,7 +1045,7 @@ if __name__ == '__main__':
 
     print("Initializing RTSE Sample Drive...")
 
-    # Initialize front camera, back-camera preview, and control connections
+    # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
     
@@ -1536,4 +1102,8 @@ if __name__ == '__main__':
             print("\nYellow Effects Triggered:")
             for effect_name, effect_count in yellow_effects.items():
                 print(f"  - {effect_name}: {effect_count}")
+        print("-" * 45)
+        print("Events Detected During Run:")
+        print(f"  🚓 Police Car Appeared:   {'YES' if summary.get('police_appeared') else 'NO'}")
+        print(f"  🚘 Trailing Car Appeared: {'YES' if summary.get('trailing_appeared') else 'NO'}")
     print("="*45 + "\n")
