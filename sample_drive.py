@@ -21,7 +21,7 @@ START_LANE = 0
 START_CENTER_HOLD_SECONDS = 2.0
 CAR_ACCELERATION = 0.84
 GREEN_CHASE_ACCELERATION = 0.70
-GREEN_STEER_GAIN = 4.0
+GREEN_STEER_GAIN = 6.0
 GREEN_STEER_DEADZONE = 0.015
 GREEN_MIN_STEER = 0.18
 MIN_LOOKAHEAD_Y_RATIO = 0.25
@@ -41,13 +41,16 @@ TOKEN_COLLECTION_COOLDOWN_SECONDS = 2.0
 HAZARD_AVOID_Y_MIN = 25
 MIN_ACCELERATION_WHEN_SLOWED = 0.60
 MIN_STEERING_ACCELERATION = 0.56
-GREEN_APPROACH_STEER_DEADZONE = 0.04
-GREEN_APPROACH_MIN_STEER = 0.65
-GREEN_APPROACH_MAX_ACCELERATION = 0.58
+GREEN_APPROACH_STEER_DEADZONE = 0.025
+GREEN_APPROACH_MIN_STEER = 0.85
+GREEN_APPROACH_MIN_ACCELERATION = 0.66
+GREEN_APPROACH_MAX_ACCELERATION = 0.72
+GREEN_VISUAL_CORRECTION_ACCELERATION = 0.60
 TOKEN_VISIBLE_MAX_ACCELERATION = 0.62
 HIGH_SPEED_MAX_ACCELERATION = 0.72
 HAZARD_AVOID_STEER = 1.0
 HAZARD_AVOID_MAX_ACCELERATION = 0.55
+TOKEN_CENTER_X_DEADZONE = 0.025
 TOKEN_ROW_GROUP_Y_RATIO = 0.12
 HAZARD_EMERGENCY_Y_RATIO = 0.40
 HAZARD_SIDE_BUFFER_Y_RATIO = 0.08
@@ -686,7 +689,8 @@ def maybe_record_collected_token(tokens, frame_width, frame_height):
             continue
 
         token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
-        if token_lane != current_lane:
+        token_is_centered = abs(token['x'] - (frame_width / 2.0)) <= frame_width * 0.16
+        if token_lane != current_lane and not token_is_centered:
             continue
 
         color = token.get('true_color', token.get('color'))
@@ -902,9 +906,10 @@ locked_green_until = 0.0
 committed_target_lane = None
 committed_target_until = 0.0
 committed_target_reason = "MAINTAIN"
+last_token_debug_time = 0.0
 run_start_time = None
 def send_controls_task():
-    global control_conn, steering_state, tap_loop_count, current_lane, last_token_lane, last_token_time, locked_green_lane, locked_green_until, committed_target_lane, committed_target_until, committed_target_reason, run_start_time
+    global control_conn, steering_state, tap_loop_count, current_lane, last_token_lane, last_token_time, locked_green_lane, locked_green_until, committed_target_lane, committed_target_until, committed_target_reason, last_token_debug_time, run_start_time
     
     if control_conn is None:
         return
@@ -1002,6 +1007,9 @@ def send_controls_task():
     chosen_target_lane = None
     decision_reason = "MAINTAIN"
     green_debug = "none"
+    green_error = None
+    visual_steer = 0.0
+    steering_source = "none"
 
     now = time.time()
     committed_green_active = committed_target_reason in ["COLLECT_GREEN", "GREEN_LOCK", "WAIT_GREEN"]
@@ -1037,27 +1045,15 @@ def send_controls_task():
     if not any_green_visible:
         last_token_lane = None
         last_token_time = 0.0
-    if best_green is None or best_green['lane'] in hazard_lanes:
-        if not committed_green_visible:
-            committed_target_lane = None
-            committed_target_until = 0.0
-            committed_target_reason = "MAINTAIN"
 
     green_target_active = decision_reason in ["COLLECT_GREEN", "GREEN_LOCK"]
     current_lane_blocked = current_lane in hazard_lanes
     target_lane_blocked = chosen_target_lane in hazard_lanes if chosen_target_lane is not None else False
 
-    if target_lane_blocked or (closest_hazard is not None and not green_target_active):
+    if target_lane_blocked or (current_lane_blocked and not green_target_active):
         clear_lanes = [lane for lane in [-2, -1, 0, 1, 2] if lane not in hazard_lanes]
         if clear_lanes:
-            if closest_hazard is not None:
-                hazard_lane = closest_hazard['lane']
-                chosen_target_lane = min(
-                    clear_lanes,
-                    key=lambda lane: (abs(lane - current_lane), -abs(lane - hazard_lane), abs(lane))
-                )
-            else:
-                chosen_target_lane = min(clear_lanes, key=lambda lane: (abs(lane - current_lane), abs(lane)))
+            chosen_target_lane = min(clear_lanes, key=lambda lane: (abs(lane - current_lane), abs(lane)))
             decision_reason = "AVOID_RED_YELLOW"
 
     # Baseline Strategy
@@ -1084,8 +1080,11 @@ def send_controls_task():
     if decision_reason in ["COLLECT_GREEN", "GREEN_LOCK", "AVOID_RED_YELLOW"]:
         with data_lock:
             if shared_data['target_lane'] != chosen_target_lane:
+                old_target_lane = shared_data['target_lane']
                 shared_data['target_lane'] = chosen_target_lane
-                if steering_state == 1:
+                old_direction = 0 if old_target_lane == current_lane else (1 if old_target_lane > current_lane else -1)
+                new_direction = 0 if chosen_target_lane == current_lane else (1 if chosen_target_lane > current_lane else -1)
+                if steering_state == 1 and old_direction != new_direction:
                     tap_loop_count = 0
 
     if steering_state == 0:
@@ -1102,8 +1101,10 @@ def send_controls_task():
         if tgt_lane == current_lane:
             steering_state = 0
             steering_input = 0.0
+            steering_source = "lane_reached"
         else:
             steering_input = 1.0 if tgt_lane > current_lane else -1.0
+            steering_source = "lane_change"
             
             lane_gap = abs(tgt_lane - current_lane)
 
@@ -1124,6 +1125,7 @@ def send_controls_task():
 
     elif steering_state == 2:
         steering_input = 0.0
+        steering_source = "lane_reset"
         tap_loop_count += 1
         if tap_loop_count >= adaptive_reset_loops:
             tap_loop_count = 0
@@ -1136,34 +1138,74 @@ def send_controls_task():
             shared_data['target_lane'] = current_lane
 
     if active_green_target is not None and active_green_target['lane'] not in hazard_lanes:
-        if chosen_target_lane is not None and chosen_target_lane != current_lane:
+        green_error = (active_green_target['x'] - (img_w / 2.0)) / (img_w / 2.0)
+        if abs(green_error) > TOKEN_CENTER_X_DEADZONE:
+            visual_steer = max(-1.0, min(1.0, green_error * GREEN_STEER_GAIN))
+            if abs(visual_steer) < GREEN_APPROACH_MIN_STEER:
+                visual_steer = GREEN_APPROACH_MIN_STEER if visual_steer > 0 else -GREEN_APPROACH_MIN_STEER
+            steering_input = visual_steer
+            steering_source = "visual_green"
+            acceleration_input = min(acceleration_input, GREEN_VISUAL_CORRECTION_ACCELERATION)
+            if chosen_target_lane is not None and chosen_target_lane != current_lane:
+                with data_lock:
+                    shared_data['target_lane'] = chosen_target_lane
+                if steering_state == 0:
+                    steering_state = 1
+                    tap_loop_count = 0
+        elif chosen_target_lane is not None and chosen_target_lane != current_lane:
             steering_input = 1.0 if chosen_target_lane > current_lane else -1.0
-            acceleration_input = min(acceleration_input, GREEN_APPROACH_MAX_ACCELERATION)
+            acceleration_input = max(
+                GREEN_APPROACH_MIN_ACCELERATION,
+                min(acceleration_input, GREEN_APPROACH_MAX_ACCELERATION)
+            )
         else:
-            green_error = (active_green_target['x'] - (img_w / 2.0)) / (img_w / 2.0)
-            if abs(green_error) > GREEN_APPROACH_STEER_DEADZONE:
-                visual_steer = max(-1.0, min(1.0, green_error * GREEN_STEER_GAIN))
-                if abs(visual_steer) < GREEN_APPROACH_MIN_STEER:
-                    visual_steer = GREEN_APPROACH_MIN_STEER if visual_steer > 0 else -GREEN_APPROACH_MIN_STEER
-                steering_input = visual_steer
-                acceleration_input = min(acceleration_input, GREEN_APPROACH_MAX_ACCELERATION)
-            elif decision_reason in ["COLLECT_GREEN", "GREEN_LOCK"]:
-                acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
+            if decision_reason in ["COLLECT_GREEN", "GREEN_LOCK"]:
+                steering_input = 0.0
+                steering_source = "green_centered"
+                acceleration_input = max(
+                    GREEN_APPROACH_MIN_ACCELERATION,
+                    min(acceleration_input, GREEN_CHASE_ACCELERATION)
+                )
     elif decision_reason == "AVOID_RED_YELLOW" and closest_hazard is not None:
-        if closest_hazard['lane'] == current_lane:
+        hazard_error = (closest_hazard['x'] - (img_w / 2.0)) / (img_w / 2.0)
+        if abs(hazard_error) > TOKEN_CENTER_X_DEADZONE:
+            steering_input = -HAZARD_AVOID_STEER if hazard_error > 0 else HAZARD_AVOID_STEER
+            steering_source = "visual_hazard"
+        elif closest_hazard['lane'] == current_lane:
             clear_lanes = [lane for lane in [-2, -1, 0, 1, 2] if lane not in hazard_lanes]
             if clear_lanes:
                 escape_lane = min(clear_lanes, key=lambda lane: (abs(lane - current_lane), abs(lane)))
                 steering_input = HAZARD_AVOID_STEER if escape_lane > current_lane else -HAZARD_AVOID_STEER
+                steering_source = "hazard_lane"
         elif closest_hazard['lane'] > current_lane:
             steering_input = -HAZARD_AVOID_STEER
+            steering_source = "hazard_lane"
         else:
             steering_input = HAZARD_AVOID_STEER
+            steering_source = "hazard_lane"
         acceleration_input = min(acceleration_input, HAZARD_AVOID_MAX_ACCELERATION)
 
     with data_lock:
         hazard_debug = "none" if closest_hazard is None else f"{closest_hazard['color']} lane {closest_hazard['lane']} y {closest_hazard['y']}"
-        shared_data['decision_debug'] = f"Reason: {decision_reason} | Cur: {current_lane} | Target: {shared_data['target_lane']} | GreenTarget: {green_debug} | Avoid: {sorted(hazard_lanes)} {hazard_debug} | GoTo: {chosen_target_lane}"
+        green_x_debug = "none" if active_green_target is None else f"x {active_green_target['x']}"
+        center_x = img_w / 2.0
+        green_error_debug = "none" if green_error is None else f"{green_error:.3f}"
+        lock_debug = "ON" if locked_green_lane is not None and now < locked_green_until else "OFF"
+        shared_data['decision_debug'] = f"Reason: {decision_reason} | Cur: {current_lane} | Target: {shared_data['target_lane']} | Green: {green_debug} {green_x_debug} Cx {center_x:.0f} Err {green_error_debug} | Src: {steering_source} | Steer: {steering_input:.2f} | Accel: {acceleration_input:.2f} | Lock: {lock_debug}"
+
+    if tokens_snapshot and now - last_token_debug_time >= 0.5:
+        debug_parts = []
+        for token in tokens_snapshot[:6]:
+            token_lane = lane_from_x(token['x'], token['y'], frame_width=img_w, frame_height=img_h)
+            debug_parts.append(f"{token.get('color')}@({token['x']},{token['y']})->L{token_lane}")
+        print(
+            "[DecisionDebug] "
+            f"tokens={'; '.join(debug_parts)} | current={current_lane} | target={chosen_target_lane} | "
+            f"green_x={green_x_debug} | center_x={img_w / 2.0:.0f} | green_error={green_error_debug} | "
+            f"visual_steer={visual_steer:.2f} | source={steering_source} | "
+            f"steer={steering_input:.2f} | accel={acceleration_input:.2f} | reason={decision_reason} | lock={lock_debug}"
+        )
+        last_token_debug_time = now
 
     try:
         send_control_packet(steering_input, acceleration_input)
