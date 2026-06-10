@@ -21,8 +21,8 @@ START_CENTER_HOLD_SECONDS = 2.0
 CAR_ACCELERATION = 0.78
 GREEN_CHASE_ACCELERATION = 0.62
 TOKEN_DECISION_Y_MIN = 70
-TOKEN_TARGET_MEMORY_SECONDS = 0.65
-GREEN_TARGET_LOCK_SECONDS = 0.65
+TOKEN_TARGET_MEMORY_SECONDS = 0.22
+GREEN_TARGET_LOCK_SECONDS = 0.35
 YELLOW_EFFECT_DURATION_SECONDS = 5.0
 TOKEN_COLLECTION_Y_RATIO = 0.78
 TOKEN_COLLECTION_COOLDOWN_SECONDS = 0.7
@@ -39,12 +39,17 @@ GREEN_REACHABILITY_BASE_MARGIN = 0.035
 CAR_PICKUP_X_RATIO = 0.50
 
 # Hazard avoidance during normal driving. Red and yellow tokens remain detected,
-# but the token-only controller does not intentionally collect them.
-UNWANTED_TOKEN_AVOID_Y_RATIO = 0.52
-YELLOW_HAZARD_PENALTY = 10.0
-RED_HAZARD_PENALTY = 8.0
-LANE_SWITCH_PENALTY = 0.65
-GREEN_LANE_REWARD = 3.0
+# but the token-only controller does not intentionally collect them. Lane values
+# from the camera are RELATIVE offsets and must be converted before planning.
+UNWANTED_TOKEN_AVOID_Y_RATIO = 0.30
+EMERGENCY_HAZARD_Y_RATIO = 0.42
+EMERGENCY_ESCAPE_ACCELERATION = 0.34
+EMERGENCY_BRAKE_ACCELERATION = 0.24
+YELLOW_EFFECT_SAFE_ACCELERATION = 0.38
+YELLOW_HAZARD_PENALTY = 20.0
+RED_HAZARD_PENALTY = 18.0
+LANE_SWITCH_PENALTY = 0.35
+GREEN_LANE_REWARD = 2.5
 
 # Accuracy improvements -------------------------------------------------------
 # Green tokens must persist across new camera frames before the car chases them.
@@ -57,8 +62,8 @@ STALE_FRONT_FRAME_SECONDS = 0.35
 
 # A hidden type must be treated as dangerous. Do not use its internal true colour
 # when selecting a lane; the true colour is retained only for local bookkeeping.
-UNKNOWN_HAZARD_PENALTY = 14.0
-HAZARD_BLOCK_Y_MARGIN_RATIO = 0.05
+UNKNOWN_HAZARD_PENALTY = 24.0
+HAZARD_BLOCK_Y_MARGIN_RATIO = 0.10
 
 # Road-only region of interest. Tune these ratios from a simulator screenshot if
 # the visible road geometry changes. The polygon is intentionally broad initially.
@@ -639,6 +644,12 @@ def draw_detected_tokens(frame, tokens):
     return display_frame
 
 def lane_from_x(x, y=None, frame_width=640, frame_height=480):
+    """Return the token's lane OFFSET relative to the front-camera centre.
+
+    Important: this is not an absolute road lane. The camera follows the car,
+    so a token directly ahead remains offset 0 even when the car is physically
+    in lane -2, -1, +1 or +2. Use absolute_lane_for_token() in the planner.
+    """
     # If y is not provided, fallback to the old simple split method
     if y is None:
         lane_count = 5
@@ -672,6 +683,31 @@ def lane_from_x(x, y=None, frame_width=640, frame_height=480):
         return 1
     else:
         return 2
+
+
+def clamp_lane(lane):
+    """Clamp one absolute road-lane index to the valid five-lane range."""
+    return max(-2, min(2, int(lane)))
+
+
+def relative_lane_for_token(token, frame_width, frame_height):
+    """Return a token's lane offset relative to the vehicle-mounted camera."""
+    return lane_from_x(
+        token['x'], token['y'],
+        frame_width=frame_width,
+        frame_height=frame_height
+    )
+
+
+def absolute_lane_for_token(token, current_vehicle_lane, frame_width, frame_height):
+    """Convert a camera-relative token offset into an absolute road lane.
+
+    This conversion fixes the main control bug visible in the recorded run:
+    the previous planner compared relative token offsets with absolute vehicle
+    lanes, causing it to continue steering toward red and yellow tokens.
+    """
+    relative_lane = relative_lane_for_token(token, frame_width, frame_height)
+    return clamp_lane(current_vehicle_lane + relative_lane)
 
 
 def calculate_token_distance(token, frame_width, frame_height):
@@ -708,8 +744,10 @@ def evaluate_token_candidate(token, current_vehicle_lane, frame_width, frame_hei
     travel remains before the token reaches the collection line. This prevents
     the controller from starting an impossible late lane change.
     """
-    lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
-    lane = max(-2, min(2, lane))
+    relative_lane = relative_lane_for_token(token, frame_width, frame_height)
+    lane = absolute_lane_for_token(
+        token, current_vehicle_lane, frame_width, frame_height
+    )
     lane_gap = abs(lane - current_vehicle_lane)
     metrics = calculate_token_distance(token, frame_width, frame_height)
 
@@ -728,6 +766,7 @@ def evaluate_token_candidate(token, current_vehicle_lane, frame_width, frame_hei
     return {
         'token': dict(token),
         'lane': lane,
+        'relative_lane': relative_lane,
         'lane_gap': lane_gap,
         'color': token.get('color'),
         'y': token['y'],
@@ -738,7 +777,8 @@ def evaluate_token_candidate(token, current_vehicle_lane, frame_width, frame_hei
 
 
 
-def lane_has_imminent_hazard(lane, tokens, frame_width, frame_height,
+def lane_has_imminent_hazard(lane, tokens, current_vehicle_lane,
+                             frame_width, frame_height,
                              minimum_progress=UNWANTED_TOKEN_AVOID_Y_RATIO):
     """Return True if a visible red, yellow or hidden token threatens a lane."""
     for token in tokens:
@@ -746,10 +786,8 @@ def lane_has_imminent_hazard(lane, tokens, frame_width, frame_height,
         if color not in ['yellow', 'red', 'hidden']:
             continue
 
-        token_lane = lane_from_x(
-            token['x'], token['y'],
-            frame_width=frame_width,
-            frame_height=frame_height
+        token_lane = absolute_lane_for_token(
+            token, current_vehicle_lane, frame_width, frame_height
         )
         progress = token['y'] / max(float(frame_height), 1.0)
         if token_lane == lane and progress >= minimum_progress:
@@ -763,8 +801,8 @@ def lane_has_blocking_hazard(target_candidate, tokens, current_vehicle_lane,
     """
     Apply a hard veto if a visible hazard blocks the route to a green target.
 
-    The corridor includes intermediate lanes because the car may need to cross
-    them before reaching the green token's lane.
+    The corridor includes intermediate absolute lanes because the car may need
+    to cross them before reaching the intended green-token lane.
     """
     target_lane = target_candidate['lane']
     target_y = target_candidate['y']
@@ -779,20 +817,40 @@ def lane_has_blocking_hazard(target_candidate, tokens, current_vehicle_lane,
         if color not in ['yellow', 'red', 'hidden']:
             continue
 
-        token_lane = lane_from_x(
-            token['x'], token['y'],
-            frame_width=frame_width,
-            frame_height=frame_height
+        token_lane = absolute_lane_for_token(
+            token, current_vehicle_lane, frame_width, frame_height
         )
         if token_lane not in corridor_lanes:
             continue
 
         # Larger y values are closer to the car. Reject routes where the hazard
-        # is already in front of, or very close behind, the intended green.
+        # is already in front of, or close behind, the intended green token.
         if token['y'] >= target_y - margin:
             return True
 
     return False
+
+
+def choose_emergency_escape_lane(tokens, current_vehicle_lane,
+                                 frame_width, frame_height):
+    """Choose one adjacent escape lane when the current lane is dangerous.
+
+    An emergency manoeuvre is limited to one lane at a time. This avoids a
+    risky multi-lane sweep through a token row while still leaving the current
+    hazardous lane as early as possible.
+    """
+    candidate_lanes = [
+        lane for lane in (
+            current_vehicle_lane - 1,
+            current_vehicle_lane + 1,
+            current_vehicle_lane
+        )
+        if -2 <= lane <= 2
+    ]
+    return choose_low_risk_lane(
+        tokens, current_vehicle_lane, frame_width, frame_height,
+        candidate_lanes=candidate_lanes
+    )
 
 
 def choose_low_risk_lane(tokens, current_vehicle_lane, frame_width, frame_height,
@@ -813,10 +871,8 @@ def choose_low_risk_lane(tokens, current_vehicle_lane, frame_width, frame_height
             if color not in ['green', 'yellow', 'red', 'hidden']:
                 continue
 
-            token_lane = lane_from_x(
-                token['x'], token['y'],
-                frame_width=frame_width,
-                frame_height=frame_height
+            token_lane = absolute_lane_for_token(
+                token, current_vehicle_lane, frame_width, frame_height
             )
             if token_lane != lane:
                 continue
@@ -854,10 +910,8 @@ def select_best_green_candidate(candidates, tokens, current_vehicle_lane,
             if color not in ['green', 'yellow', 'red', 'hidden']:
                 continue
 
-            token_lane = lane_from_x(
-                token['x'], token['y'],
-                frame_width=frame_width,
-                frame_height=frame_height
+            token_lane = absolute_lane_for_token(
+                token, current_vehicle_lane, frame_width, frame_height
             )
             if token_lane != lane:
                 continue
@@ -923,19 +977,15 @@ def maybe_record_collected_token(tokens, frame_width, frame_height):
         if not crossed_collection_line:
             continue
 
-        token_lane = lane_from_x(
-            token['x'], token['y'],
-            frame_width=frame_width,
-            frame_height=frame_height
-        )
-        if token_lane != current_lane:
+        relative_lane = relative_lane_for_token(token, frame_width, frame_height)
+        if relative_lane != 0:
             continue
 
         color = get_actual_color(token)
         if color not in ['green', 'yellow', 'red']:
             continue
 
-        token_id = f"track:{token.get('track_id', token_lane)}"
+        token_id = f"track:{token.get('track_id', relative_lane)}"
         with data_lock:
             recent_collections = shared_data.get('last_collected_by_lane_color', {})
             already_counted = token_id in recent_collections
@@ -1241,14 +1291,61 @@ def send_controls_task():
         )
     ]
 
+    # Yellow-token effects can make perception or actuation unreliable. Reduce
+    # speed while an effect is active so the controller has more reaction time.
+    active_yellow_effect = get_active_yellow_effect()
+    if active_yellow_effect is not None:
+        acceleration_input = min(acceleration_input, YELLOW_EFFECT_SAFE_ACCELERATION)
+
+    # Safety always overrides collection. Start leaving a hazardous lane before
+    # the token reaches the old late threshold, even if a green is also visible.
+    current_lane_hazard = lane_has_imminent_hazard(
+        current_lane,
+        tokens_snapshot,
+        current_lane,
+        img_w,
+        img_h,
+        minimum_progress=UNWANTED_TOKEN_AVOID_Y_RATIO
+    )
+    current_lane_emergency = lane_has_imminent_hazard(
+        current_lane,
+        tokens_snapshot,
+        current_lane,
+        img_w,
+        img_h,
+        minimum_progress=EMERGENCY_HAZARD_Y_RATIO
+    )
+
     chosen_target_lane = None
     active_green_candidate = None
     decision_reason = 'MAINTAIN_SAFE_LANE'
     now = time.time()
 
+    # A visible hazard in the current lane overrides green collection and stale
+    # green memory. The emergency branch chooses only one adjacent move.
+    if current_lane_hazard:
+        chosen_target_lane = choose_emergency_escape_lane(
+            tokens_snapshot, current_lane, img_w, img_h
+        )
+        locked_green_lane = None
+        locked_green_until = 0.0
+        last_token_lane = None
+        last_token_time = 0.0
+        acceleration_input = min(
+            acceleration_input,
+            EMERGENCY_BRAKE_ACCELERATION
+            if current_lane_emergency
+            else EMERGENCY_ESCAPE_ACCELERATION
+        )
+        decision_reason = (
+            'EMERGENCY_ESCAPE'
+            if chosen_target_lane != current_lane
+            else 'BRAKE_FOR_HAZARD'
+        )
+
     # Retain a short lock to prevent rapid lane oscillation, but allow a new
     # visible green to replace a stale lock immediately.
-    if locked_green_lane is not None and now < locked_green_until:
+    if chosen_target_lane is None and locked_green_lane is not None and now < locked_green_until:
         same_lane_greens = [
             candidate for candidate in green_candidates
             if candidate['lane'] == locked_green_lane
@@ -1257,30 +1354,30 @@ def send_controls_task():
             same_lane_greens, tokens_snapshot, current_lane, img_w, img_h
         )
 
-    if active_green_candidate is None:
+    if chosen_target_lane is None and active_green_candidate is None:
         active_green_candidate = select_best_green_candidate(
             green_candidates, tokens_snapshot, current_lane, img_w, img_h
         )
 
-    if active_green_candidate is not None:
+    if chosen_target_lane is None and active_green_candidate is not None:
         chosen_target_lane = active_green_candidate['lane']
         locked_green_lane = chosen_target_lane
         locked_green_until = now + GREEN_TARGET_LOCK_SECONDS
         last_token_lane = chosen_target_lane
         last_token_time = now
         decision_reason = 'COLLECT_GREEN'
-    elif (
+    elif chosen_target_lane is None and (
         last_token_lane is not None
         and now - last_token_time < TOKEN_TARGET_MEMORY_SECONDS
         and not lane_has_imminent_hazard(
-            last_token_lane, tokens_snapshot, img_w, img_h
+            last_token_lane, tokens_snapshot, current_lane, img_w, img_h
         )
     ):
         # Brief memory prevents a lane change from being aborted by one missed
         # contour, but a newly visible hazard always cancels stale green memory.
         chosen_target_lane = last_token_lane
         decision_reason = 'GREEN_MEMORY'
-    else:
+    elif chosen_target_lane is None:
         chosen_target_lane = choose_low_risk_lane(
             tokens_snapshot, current_lane, img_w, img_h
         )
@@ -1290,7 +1387,7 @@ def send_controls_task():
             else 'MAINTAIN_SAFE_LANE'
         )
 
-    chosen_target_lane = max(-2, min(2, chosen_target_lane))
+    chosen_target_lane = clamp_lane(chosen_target_lane)
     with data_lock:
         shared_data['target_lane'] = chosen_target_lane
 
@@ -1337,6 +1434,7 @@ def send_controls_task():
         debug_suffix = (
             f" | Dist: {active_green_candidate['image_distance']:.3f}"
             f" | RemY: {active_green_candidate['remaining_y_ratio']:.3f}"
+            f" | Rel: {active_green_candidate.get('relative_lane', 0):+d}"
         )
 
     state_names = {
