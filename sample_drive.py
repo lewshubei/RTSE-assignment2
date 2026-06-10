@@ -46,6 +46,31 @@ RED_HAZARD_PENALTY = 8.0
 LANE_SWITCH_PENALTY = 0.65
 GREEN_LANE_REWARD = 3.0
 
+# Accuracy improvements -------------------------------------------------------
+# Green tokens must persist across new camera frames before the car chases them.
+# Two frames is a good initial balance between recall and false-positive control.
+GREEN_CONFIRM_FRAMES = 2
+TOKEN_TRACK_MAX_MISSES = 4
+TOKEN_TRACK_MAX_AGE_SECONDS = 0.45
+TOKEN_TRACK_MATCH_DISTANCE_RATIO = 0.075
+STALE_FRONT_FRAME_SECONDS = 0.35
+
+# A hidden type must be treated as dangerous. Do not use its internal true colour
+# when selecting a lane; the true colour is retained only for local bookkeeping.
+UNKNOWN_HAZARD_PENALTY = 14.0
+HAZARD_BLOCK_Y_MARGIN_RATIO = 0.05
+
+# Road-only region of interest. Tune these ratios from a simulator screenshot if
+# the visible road geometry changes. The polygon is intentionally broad initially.
+ROAD_ROI_TOP_Y_RATIO = 0.10
+ROAD_ROI_TOP_LEFT_X_RATIO = 0.30
+ROAD_ROI_TOP_RIGHT_X_RATIO = 0.70
+ROAD_ROI_BOTTOM_Y_RATIO = 0.99
+ROAD_ROI_BOTTOM_LEFT_X_RATIO = 0.00
+ROAD_ROI_BOTTOM_RIGHT_X_RATIO = 1.00
+SHOW_ROAD_ROI = True
+SHOW_TOKEN_MASKS = False
+
 YELLOW_EFFECTS = [
     'hide_next_token_type',
     'tokens_invisible',
@@ -58,6 +83,8 @@ YELLOW_EFFECTS = [
 shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
+    'front_frame_seq': 0,
+    'front_frame_time': 0.0,
     'steering_input': 0.0,
     'acceleration_input': 0.0,
     'detected_tokens': [],
@@ -87,6 +114,12 @@ data_lock = threading.Lock()
 is_running = True
 front_camera_delay_buffer = []
 action_delay_buffer = []
+
+# Token tracks are updated only by the processing task when a new camera frame
+# arrives. The control task reads the resulting snapshot from shared_data.
+token_tracks = {}
+next_token_track_id = 1
+last_processed_front_seq = -1
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -250,6 +283,9 @@ def read_single_camera(sock, window_name, data_key, display=True):
             if frame is not None:
                 with data_lock:
                     shared_data[data_key] = frame
+                    if data_key == 'latest_front_frame':
+                        shared_data['front_frame_seq'] += 1
+                        shared_data['front_frame_time'] = time.monotonic()
                 
                 if display:
                     # You may disable this if you don't need to display the frames / This could effect the fps
@@ -269,86 +305,159 @@ def read_back_camera_task():
 
 def adjust_gamma(image, gamma=1.5):
     invGamma = 1.0 / gamma
-    table = np.array([((i/255.0) ** invGamma) * 255
+    table = np.array([((i / 255.0) ** invGamma) * 255
                       for i in np.arange(256)]).astype("uint8")
     return cv2.LUT(image, table)
+
+
+def get_visible_color(token):
+    """Return only the colour that perception is currently allowed to use."""
+    return token.get('color')
+
+
+def get_actual_color(token):
+    """Return the actual colour for collection statistics and yellow effects only."""
+    return token.get('true_color', token.get('color'))
+
+
+def create_road_roi(frame_h, frame_w):
+    """Create a broad trapezoidal mask covering the drivable road surface."""
+    points = np.array([
+        [int(frame_w * ROAD_ROI_TOP_LEFT_X_RATIO),
+         int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
+        [int(frame_w * ROAD_ROI_TOP_RIGHT_X_RATIO),
+         int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
+        [int(frame_w * ROAD_ROI_BOTTOM_RIGHT_X_RATIO),
+         int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)],
+        [int(frame_w * ROAD_ROI_BOTTOM_LEFT_X_RATIO),
+         int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)]
+    ], dtype=np.int32)
+
+    roi = np.zeros((frame_h, frame_w), dtype=np.uint8)
+    cv2.fillPoly(roi, [points], 255)
+    return roi
+
+
+def passes_round_token_shape(cnt, frame_w, frame_h, color_name):
+    """Validate a candidate using scaled area, roundness and circle fill ratio."""
+    area = cv2.contourArea(cnt)
+    frame_area = float(frame_w * frame_h)
+
+    if color_name == 'red':
+        min_area = max(55.0, frame_area * 0.00018)
+        min_circularity = 0.46
+        min_fill_ratio = 0.43
+        min_aspect, max_aspect = 0.58, 1.55
+    elif color_name == 'yellow':
+        min_area = max(35.0, frame_area * 0.00010)
+        min_circularity = 0.62
+        min_fill_ratio = 0.47
+        min_aspect, max_aspect = 0.62, 1.48
+    else:  # green
+        min_area = max(35.0, frame_area * 0.00010)
+        min_circularity = 0.48
+        min_fill_ratio = 0.40
+        min_aspect, max_aspect = 0.58, 1.55
+
+    max_area = frame_area * 0.18
+    if area < min_area or area > max_area:
+        return None
+
+    x, y, width, height = cv2.boundingRect(cnt)
+    if height <= 0:
+        return None
+
+    aspect_ratio = width / float(height)
+    if not (min_aspect <= aspect_ratio <= max_aspect):
+        return None
+
+    perimeter = cv2.arcLength(cnt, True)
+    if perimeter <= 0:
+        return None
+
+    circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+    if circularity < min_circularity:
+        return None
+
+    (center_x, center_y), radius = cv2.minEnclosingCircle(cnt)
+    if radius < 3.0:
+        return None
+
+    fill_ratio = area / (np.pi * radius * radius)
+    if fill_ratio < min_fill_ratio:
+        return None
+
+    # Exclude HUD fragments and extreme lower-edge fragments.
+    if center_y < frame_h * 0.08 or center_y > frame_h * 0.94:
+        return None
+
+    return {
+        'color': color_name,
+        'x': int(center_x),
+        'y': int(center_y),
+        'radius': int(radius),
+        'area': float(area),
+        'circularity': float(circularity),
+        'fill_ratio': float(fill_ratio)
+    }
+
+
 def detect_colored_tokens(frame):
     """
-    Detect green, yellow, and red circular tokens from the front camera.
+    Detect green, yellow and red circular tokens inside the drivable road ROI.
 
-    Red tokens are pale pink/red because of their gradient.  They need a
-    separate mask made from the original frame.  The red road markings and
-    the player's car are normally much more saturated, so an upper saturation
-    limit is used to reject them.
+    Green/yellow masks are generated from a gamma-corrected image. Red is
+    generated from the original image because pale red gradients are easier to
+    retain before brightness correction.
     """
     frame_h, frame_w = frame.shape[:2]
+    road_roi = create_road_roi(frame_h, frame_w)
 
-    # Gamma correction is useful for distant green and yellow tokens.
     frame_bright = adjust_gamma(frame, gamma=1.5)
     hsv_bright = cv2.cvtColor(frame_bright, cv2.COLOR_BGR2HSV)
-
-    # Use the original image for red. Gamma correction reduces the saturation
-    # contrast of the pale red token and can leave only a fragmented contour.
     hsv_original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     detected_tokens = []
-    standard_kernel = np.ones((5, 5), np.uint8)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    # -----------------------------------------------------
-    # Green and yellow detection
-    # -----------------------------------------------------
+    # Keep the HSV values easy to tune after testing recorded simulator frames.
     standard_color_ranges = {
-        "green": [((50, 30, 150), (70, 255, 255))],
-        "yellow": [((18, 50, 140), (30, 255, 255))]
+        'green': [((50, 30, 150), (70, 255, 255))],
+        'yellow': [((18, 50, 140), (30, 255, 255))]
     }
+
+    debug_masks = {}
 
     for color_name, ranges in standard_color_ranges.items():
         color_mask = None
-
         for lower, upper in ranges:
             current_mask = cv2.inRange(
                 hsv_bright,
                 np.array(lower, dtype=np.uint8),
                 np.array(upper, dtype=np.uint8)
             )
-            color_mask = current_mask if color_mask is None else cv2.bitwise_or(color_mask, current_mask)
+            color_mask = (
+                current_mask if color_mask is None
+                else cv2.bitwise_or(color_mask, current_mask)
+            )
 
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, standard_kernel)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, standard_kernel)
+        # Closing reconnects fragmented token pixels; the smaller opening
+        # kernel suppresses noise without deleting small distant tokens.
+        color_mask = cv2.bitwise_and(color_mask, road_roi)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, close_kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, open_kernel)
+        debug_masks[color_name] = color_mask
 
-        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+        contours, _ = cv2.findContours(
+            color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 100 or area > 300000:
-                continue
+            token = passes_round_token_shape(cnt, frame_w, frame_h, color_name)
+            if token is not None:
+                detected_tokens.append(token)
 
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                continue
-
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            min_circularity = 0.50 if color_name == "green" else 0.75
-            if circularity < min_circularity:
-                continue
-
-            (x, y), radius = cv2.minEnclosingCircle(cnt)
-            detected_tokens.append({
-                "color": color_name,
-                "x": int(x),
-                "y": int(y),
-                "radius": int(radius),
-                "area": float(area)
-            })
-
-    # -----------------------------------------------------
-    # Red token detection
-    # -----------------------------------------------------
-    # OpenCV hue wraps around: red exists near both 0 and 179.
-    #
-    # The token is a light pink/red gradient. Saturation is deliberately
-    # limited to 20..200 to retain the pale token while rejecting strongly
-    # saturated red road borders and most of the player's red car.
+    # OpenCV hue wraps around: red is near both 0 and 179.
     red_mask_1 = cv2.inRange(
         hsv_original,
         np.array((0, 20, 145), dtype=np.uint8),
@@ -360,103 +469,174 @@ def detect_colored_tokens(frame):
         np.array((179, 200, 255), dtype=np.uint8)
     )
     red_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
+    red_mask = cv2.bitwise_and(red_mask, road_roi)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, close_kernel)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, open_kernel)
+    debug_masks['red'] = red_mask
 
-    # Close first to reconnect the token's gradient. Use a smaller opening
-    # kernel afterwards so distant tokens are not erased.
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
-    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Scale the minimum area so the detector works at different resolutions.
-    red_min_area = max(70.0, frame_w * frame_h * 0.00030)
-    red_max_area = frame_w * frame_h * 0.20
-
+    red_contours, _ = cv2.findContours(
+        red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
     for cnt in red_contours:
-        area = cv2.contourArea(cnt)
-        if area < red_min_area or area > red_max_area:
-            continue
+        token = passes_round_token_shape(cnt, frame_w, frame_h, 'red')
+        if token is not None:
+            detected_tokens.append(token)
 
-        x, y, width, height = cv2.boundingRect(cnt)
-        if height == 0:
-            continue
-
-        aspect_ratio = width / float(height)
-        if not (0.58 <= aspect_ratio <= 1.55):
-            continue
-
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
-            continue
-
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-        (center_x, center_y), radius = cv2.minEnclosingCircle(cnt)
-
-        if radius <= 0:
-            continue
-
-        circle_fill_ratio = area / (np.pi * radius * radius)
-
-        # These filters retain round red tokens while rejecting thin road
-        # markings, roadside arrows and irregular red parts of the car.
-        if circularity < 0.46 or circle_fill_ratio < 0.43:
-            continue
-
-        # Ignore HUD text at the top and small fragments near the bottom edge.
-        if center_y < frame_h * 0.20 or center_y > frame_h * 0.92:
-            continue
-
-        detected_tokens.append({
-            "color": "red",
-            "x": int(center_x),
-            "y": int(center_y),
-            "radius": int(radius),
-            "area": float(area)
-        })
-
-    # Optional tuning window. Uncomment temporarily if you need to inspect
-    # which pixels are selected as red:
-    # cv2.imshow("Red Token Mask", cv2.resize(red_mask, (640, 480)))
-    # cv2.waitKey(1)
+    if SHOW_TOKEN_MASKS:
+        for color_name, mask in debug_masks.items():
+            cv2.imshow(
+                f'{color_name.title()} Token Mask',
+                cv2.resize(mask, (640, 480))
+            )
 
     return detected_tokens
 
+
+def update_token_tracks(detections, frame_width, frame_height):
+    """
+    Add stable track IDs and consecutive-frame hit counts.
+
+    The controller chases a green token only after GREEN_CONFIRM_FRAMES hits.
+    Hazard colours remain immediately usable so red/yellow avoidance is fast.
+    """
+    global next_token_track_id
+
+    now = time.monotonic()
+    unmatched_track_ids = set(token_tracks.keys())
+    tracked_detections = []
+
+    # Nearest objects are matched first because they are the most safety-critical.
+    for detection in sorted(detections, key=lambda item: item['y'], reverse=True):
+        actual_color = get_actual_color(detection)
+        detection_lane = lane_from_x(
+            detection['x'], detection['y'],
+            frame_width=frame_width,
+            frame_height=frame_height
+        )
+
+        best_track_id = None
+        best_distance = float('inf')
+
+        for track_id in unmatched_track_ids:
+            track = token_tracks[track_id]
+            if track['actual_color'] != actual_color:
+                continue
+
+            track_lane = lane_from_x(
+                track['x'], track['y'],
+                frame_width=frame_width,
+                frame_height=frame_height
+            )
+            if abs(track_lane - detection_lane) > 1:
+                continue
+
+            distance = float(np.hypot(
+                detection['x'] - track['x'],
+                detection['y'] - track['y']
+            ))
+            match_limit = max(
+                24.0,
+                frame_width * TOKEN_TRACK_MATCH_DISTANCE_RATIO,
+                3.0 * max(detection['radius'], track['radius'])
+            )
+
+            if distance <= match_limit and distance < best_distance:
+                best_track_id = track_id
+                best_distance = distance
+
+        if best_track_id is None:
+            track_id = next_token_track_id
+            next_token_track_id += 1
+            previous_y = detection['y']
+            token_tracks[track_id] = {
+                'x': detection['x'],
+                'y': detection['y'],
+                'radius': detection['radius'],
+                'actual_color': actual_color,
+                'hits': 1,
+                'misses': 0,
+                'last_seen': now
+            }
+        else:
+            track_id = best_track_id
+            track = token_tracks[track_id]
+            previous_y = track['y']
+            track.update({
+                'x': detection['x'],
+                'y': detection['y'],
+                'radius': detection['radius'],
+                'actual_color': actual_color,
+                'hits': track['hits'] + 1,
+                'misses': 0,
+                'last_seen': now
+            })
+            unmatched_track_ids.remove(track_id)
+
+        enriched = dict(detection)
+        enriched['track_id'] = track_id
+        enriched['hits'] = token_tracks[track_id]['hits']
+        enriched['previous_y'] = previous_y
+        tracked_detections.append(enriched)
+
+    for track_id in list(unmatched_track_ids):
+        track = token_tracks.get(track_id)
+        if track is None:
+            continue
+        track['misses'] += 1
+        if (
+            track['misses'] > TOKEN_TRACK_MAX_MISSES
+            or now - track['last_seen'] > TOKEN_TRACK_MAX_AGE_SECONDS
+        ):
+            token_tracks.pop(track_id, None)
+
+    return tracked_detections
+
 def draw_detected_tokens(frame, tokens):
-    """
-    Draw bounding boxes and semi-transparent overlays for all detected tokens.
-    """
+    """Draw detected tokens, temporal hit counts and the road ROI."""
     display_frame = frame.copy()
     frame_h, frame_w = display_frame.shape[:2]
 
     text_colors = {
-        "green": (0, 255, 0),
-        "yellow": (0, 255, 255),
-        "red": (0, 0, 255),
-        "hidden": (255, 255, 255)
+        'green': (0, 255, 0),
+        'yellow': (0, 255, 255),
+        'red': (0, 0, 255),
+        'hidden': (255, 255, 255)
     }
+
+    if SHOW_ROAD_ROI:
+        roi_points = np.array([
+            [int(frame_w * ROAD_ROI_TOP_LEFT_X_RATIO), int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
+            [int(frame_w * ROAD_ROI_TOP_RIGHT_X_RATIO), int(frame_h * ROAD_ROI_TOP_Y_RATIO)],
+            [int(frame_w * ROAD_ROI_BOTTOM_RIGHT_X_RATIO), int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)],
+            [int(frame_w * ROAD_ROI_BOTTOM_LEFT_X_RATIO), int(frame_h * ROAD_ROI_BOTTOM_Y_RATIO)]
+        ], dtype=np.int32)
+        cv2.polylines(display_frame, [roi_points], True, (255, 255, 255), 1)
 
     overlay = display_frame.copy()
     for token in tokens:
-        color = text_colors.get(token["color"], (255, 255, 255))
-        center = (token["x"], token["y"])
-        radius = token["radius"]
-        # Semi-transparent filled circle
+        visible_color = get_visible_color(token)
+        color = text_colors.get(visible_color, (255, 255, 255))
+        center = (token['x'], token['y'])
+        radius = token['radius']
+
         cv2.circle(overlay, center, radius, color, -1)
-        # Bounding box
-        x1 = max(center[0]-radius, 0)
-        y1 = max(center[1]-radius, 0)
-        x2 = min(center[0]+radius, frame_w-1)
-        y2 = min(center[1]+radius, frame_h-1)
+
+        x1 = max(center[0] - radius, 0)
+        y1 = max(center[1] - radius, 0)
+        x2 = min(center[0] + radius, frame_w - 1)
+        y2 = min(center[1] + radius, frame_h - 1)
         cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-        # Color label
-        cv2.putText(display_frame, token["color"].upper(), (x1, y1-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    # Blend overlay with original frame
-    alpha = 0.3
-    cv2.addWeighted(overlay, alpha, display_frame, 1-alpha, 0, display_frame)
+        label = visible_color.upper()
+        if 'track_id' in token:
+            label += f" T{token['track_id']} H{token.get('hits', 1)}"
+        cv2.putText(
+            display_frame, label, (x1, max(y1 - 10, 18)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2
+        )
+
+    cv2.addWeighted(overlay, 0.30, display_frame, 0.70, 0, display_frame)
     return display_frame
-
 
 def lane_from_x(x, y=None, frame_width=640, frame_height=480):
     # If y is not provided, fallback to the old simple split method
@@ -558,14 +738,66 @@ def evaluate_token_candidate(token, current_vehicle_lane, frame_width, frame_hei
 
 
 
+def lane_has_imminent_hazard(lane, tokens, frame_width, frame_height,
+                             minimum_progress=UNWANTED_TOKEN_AVOID_Y_RATIO):
+    """Return True if a visible red, yellow or hidden token threatens a lane."""
+    for token in tokens:
+        color = get_visible_color(token)
+        if color not in ['yellow', 'red', 'hidden']:
+            continue
+
+        token_lane = lane_from_x(
+            token['x'], token['y'],
+            frame_width=frame_width,
+            frame_height=frame_height
+        )
+        progress = token['y'] / max(float(frame_height), 1.0)
+        if token_lane == lane and progress >= minimum_progress:
+            return True
+
+    return False
+
+
+def lane_has_blocking_hazard(target_candidate, tokens, current_vehicle_lane,
+                             frame_width, frame_height):
+    """
+    Apply a hard veto if a visible hazard blocks the route to a green target.
+
+    The corridor includes intermediate lanes because the car may need to cross
+    them before reaching the green token's lane.
+    """
+    target_lane = target_candidate['lane']
+    target_y = target_candidate['y']
+    margin = frame_height * HAZARD_BLOCK_Y_MARGIN_RATIO
+    corridor_lanes = set(range(
+        min(current_vehicle_lane, target_lane),
+        max(current_vehicle_lane, target_lane) + 1
+    ))
+
+    for token in tokens:
+        color = get_visible_color(token)
+        if color not in ['yellow', 'red', 'hidden']:
+            continue
+
+        token_lane = lane_from_x(
+            token['x'], token['y'],
+            frame_width=frame_width,
+            frame_height=frame_height
+        )
+        if token_lane not in corridor_lanes:
+            continue
+
+        # Larger y values are closer to the car. Reject routes where the hazard
+        # is already in front of, or very close behind, the intended green.
+        if token['y'] >= target_y - margin:
+            return True
+
+    return False
+
+
 def choose_low_risk_lane(tokens, current_vehicle_lane, frame_width, frame_height,
                          candidate_lanes=None):
-    """
-    Choose the safest lane when no reachable green target exists.
-
-    Red and yellow tokens remain visible to perception, but this token-only
-    controller uses them as hazards rather than intentional collection targets.
-    """
+    """Choose a safe lane when no confirmed and reachable green route exists."""
     if candidate_lanes is None:
         candidate_lanes = list(range(-2, 3))
 
@@ -577,8 +809,8 @@ def choose_low_risk_lane(tokens, current_vehicle_lane, frame_width, frame_height
         score = -abs(lane - current_vehicle_lane) * LANE_SWITCH_PENALTY
 
         for token in tokens:
-            color = token.get('true_color', token.get('color'))
-            if color not in ['green', 'yellow', 'red']:
+            color = get_visible_color(token)
+            if color not in ['green', 'yellow', 'red', 'hidden']:
                 continue
 
             token_lane = lane_from_x(
@@ -592,13 +824,15 @@ def choose_low_risk_lane(tokens, current_vehicle_lane, frame_width, frame_height
             progress = token['y'] / max(float(frame_height), 1.0)
             proximity_weight = 1.0 + 4.0 * progress * progress
 
-            if color == 'green':
+            if color == 'green' and token.get('hits', 1) >= GREEN_CONFIRM_FRAMES:
                 score += GREEN_LANE_REWARD * proximity_weight
             elif progress >= UNWANTED_TOKEN_AVOID_Y_RATIO:
                 if color == 'yellow':
                     score -= YELLOW_HAZARD_PENALTY * proximity_weight
                 elif color == 'red':
                     score -= RED_HAZARD_PENALTY * proximity_weight
+                elif color == 'hidden':
+                    score -= UNKNOWN_HAZARD_PENALTY * proximity_weight
 
         if score > best_score:
             best_score = score
@@ -606,16 +840,9 @@ def choose_low_risk_lane(tokens, current_vehicle_lane, frame_width, frame_height
 
     return best_lane
 
-
 def select_best_green_candidate(candidates, tokens, current_vehicle_lane,
                                 frame_width, frame_height):
-    """
-    Select a reachable green target using a lane-route score.
-
-    The immediate token remains important, but the score also rewards other
-    visible greens in the same lane and penalises nearby red/yellow hazards.
-    This is more useful than selecting only the closest contour.
-    """
+    """Select the best confirmed green route using only currently visible types."""
     if not candidates:
         return None
 
@@ -623,8 +850,8 @@ def select_best_green_candidate(candidates, tokens, current_vehicle_lane,
     for lane in range(-2, 3):
         score = -abs(lane - current_vehicle_lane) * LANE_SWITCH_PENALTY
         for token in tokens:
-            color = token.get('true_color', token.get('color'))
-            if color not in ['green', 'yellow', 'red']:
+            color = get_visible_color(token)
+            if color not in ['green', 'yellow', 'red', 'hidden']:
                 continue
 
             token_lane = lane_from_x(
@@ -637,13 +864,15 @@ def select_best_green_candidate(candidates, tokens, current_vehicle_lane,
 
             progress = token['y'] / max(float(frame_height), 1.0)
             proximity_weight = 1.0 + 4.0 * progress * progress
-            if color == 'green':
+            if color == 'green' and token.get('hits', 1) >= GREEN_CONFIRM_FRAMES:
                 score += GREEN_LANE_REWARD * proximity_weight
             elif progress >= UNWANTED_TOKEN_AVOID_Y_RATIO:
                 if color == 'yellow':
                     score -= YELLOW_HAZARD_PENALTY * proximity_weight
                 elif color == 'red':
                     score -= RED_HAZARD_PENALTY * proximity_weight
+                elif color == 'hidden':
+                    score -= UNKNOWN_HAZARD_PENALTY * proximity_weight
         lane_scores[lane] = score
 
     return max(
@@ -653,7 +882,6 @@ def select_best_green_candidate(candidates, tokens, current_vehicle_lane,
             candidate['route_score']
         )
     )
-
 
 def get_active_yellow_effect():
     now = time.time()
@@ -677,7 +905,12 @@ def start_random_yellow_effect():
             shared_data['hidden_next_token_type'] = True
 
 def maybe_record_collected_token(tokens, frame_width, frame_height):
-    """Estimate accidental or intentional token collection for local effects."""
+    """
+    Estimate collection only when a tracked token crosses the pickup line.
+
+    Track IDs avoid double counting a persistent contour and avoid suppressing a
+    genuinely new token that appears shortly afterwards in the same lane.
+    """
     global locked_green_lane, locked_green_until
 
     now = time.time()
@@ -685,7 +918,9 @@ def maybe_record_collected_token(tokens, frame_width, frame_height):
     collected = None
 
     for token in tokens:
-        if token['y'] < collection_y:
+        previous_y = token.get('previous_y', token['y'])
+        crossed_collection_line = previous_y < collection_y <= token['y']
+        if not crossed_collection_line:
             continue
 
         token_lane = lane_from_x(
@@ -696,19 +931,16 @@ def maybe_record_collected_token(tokens, frame_width, frame_height):
         if token_lane != current_lane:
             continue
 
-        color = token.get('true_color', token.get('color'))
+        color = get_actual_color(token)
         if color not in ['green', 'yellow', 'red']:
             continue
 
-        token_id = f"{token_lane}:{color}"
+        token_id = f"track:{token.get('track_id', token_lane)}"
         with data_lock:
             recent_collections = shared_data.get('last_collected_by_lane_color', {})
-            recent_same_token = (
-                now - recent_collections.get(token_id, 0.0)
-                < TOKEN_COLLECTION_COOLDOWN_SECONDS
-            )
+            already_counted = token_id in recent_collections
 
-        if recent_same_token:
+        if already_counted:
             continue
 
         collected = (token_id, color)
@@ -725,13 +957,10 @@ def maybe_record_collected_token(tokens, frame_width, frame_height):
         shared_data['run_summary'][f'{color}_collected'] += 1
 
     if color == 'yellow':
-        # Yellow is never an intentional target, but an accidental pickup still
-        # activates the required random disruption model.
         start_random_yellow_effect()
     elif color == 'green':
         locked_green_lane = None
         locked_green_until = 0.0
-
 
 def apply_camera_effects(front_frame):
     effect = get_active_yellow_effect()
@@ -804,150 +1033,87 @@ def send_control_packet(steering_input, acceleration_input):
 
 def processing_task():
     """
-    Detect tokens from the front camera and display both camera previews.
+    Detect tokens from each new front-camera frame and display both previews.
 
-    The back-camera frame is displayed only as a live preview.
-    Police-car and trailing-car detection are intentionally disabled for now.
+    The back-camera frame remains a live preview only. Tracking is updated only
+    once per new front frame so hit counts represent real observations rather
+    than repeated processing-loop iterations.
     """
+    global last_processed_front_seq
 
-    # Copy the latest frames safely from shared memory.
     with data_lock:
         front_frame = shared_data.get('latest_front_frame')
         back_frame = shared_data.get('latest_back_frame')
+        front_frame_seq = shared_data.get('front_frame_seq', 0)
 
     window_updated = False
 
-    # ---------------------------------------------------------
-    # 1. Display back-camera preview only
-    # ---------------------------------------------------------
     if back_frame is not None:
         try:
             back_debug_frame = back_frame.copy()
-
             cv2.putText(
-                back_debug_frame,
-                "Back Camera Preview",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
+                back_debug_frame, 'Back Camera Preview', (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
-
-            back_debug_frame = cv2.resize(
-                back_debug_frame,
-                (640, 480)
-            )
-
-            cv2.imshow("Back Camera", back_debug_frame)
+            cv2.imshow('Back Camera', cv2.resize(back_debug_frame, (640, 480)))
             window_updated = True
-
         except Exception as e:
-            print(f"Back camera display error: {e}")
+            print(f'Back camera display error: {e}')
 
-    # ---------------------------------------------------------
-    # 2. Process tokens using the front camera only
-    # ---------------------------------------------------------
-    if front_frame is not None:
+    if front_frame is not None and front_frame_seq != last_processed_front_seq:
         try:
-            # Apply any active yellow-token camera effect.
+            last_processed_front_seq = front_frame_seq
             processed_front_frame = apply_camera_effects(front_frame)
 
-            # Detect green, yellow and red tokens.
             tokens = detect_colored_tokens(processed_front_frame)
-
-            # Apply yellow-token visibility effects when active.
             tokens = apply_token_visibility_effects(tokens)
+            tokens = update_token_tracks(
+                tokens,
+                processed_front_frame.shape[1],
+                processed_front_frame.shape[0]
+            )
 
             with data_lock:
                 shared_data['detected_tokens'] = tokens
 
-            # Draw token overlays.
-            debug_frame = draw_detected_tokens(
-                processed_front_frame,
-                tokens
-            )
+            debug_frame = draw_detected_tokens(processed_front_frame, tokens)
 
             with data_lock:
-                decision_text = shared_data.get(
-                    'decision_debug',
-                    ''
-                )
-                target_debug = shared_data.get(
-                    'target_token_debug'
-                )
+                decision_text = shared_data.get('decision_debug', '')
+                target_debug = shared_data.get('target_token_debug')
 
-            # Display the current driving decision.
             if decision_text:
                 cv2.putText(
-                    debug_frame,
-                    decision_text,
-                    (10, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.50,
-                    (255, 255, 255),
-                    2
+                    debug_frame, decision_text, (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2
                 )
 
-            # Mark the selected green-token target.
             if target_debug is not None:
                 target_token = target_debug.get('token', {})
-
                 tx = int(target_token.get('x', 0))
                 ty = int(target_token.get('y', 0))
-
-                cv2.circle(
-                    debug_frame,
-                    (tx, ty),
-                    10,
-                    (255, 255, 255),
-                    2
-                )
-
+                cv2.circle(debug_frame, (tx, ty), 10, (255, 255, 255), 2)
                 cv2.putText(
                     debug_frame,
-                    (
-                        f"TARGET D="
-                        f"{target_debug.get('image_distance', 0.0):.3f}"
-                    ),
+                    f"TARGET D={target_debug.get('image_distance', 0.0):.3f}",
                     (max(tx - 85, 0), max(ty - 24, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.50,
-                    (255, 255, 255),
-                    2
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2
                 )
 
-            # Display the active yellow-token disruption effect.
             effect = get_active_yellow_effect()
-
             if effect:
                 cv2.putText(
-                    debug_frame,
-                    f"Yellow Effect: {effect}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2
+                    debug_frame, f'Yellow Effect: {effect}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
                 )
 
-            debug_frame = cv2.resize(
-                debug_frame,
-                (640, 480)
-            )
-
-            cv2.imshow("Front Camera", debug_frame)
+            cv2.imshow('Front Camera', cv2.resize(debug_frame, (640, 480)))
             window_updated = True
-
         except Exception as e:
-            print(f"Front camera processing error: {e}")
+            print(f'Front camera processing error: {e}')
 
-    # ---------------------------------------------------------
-    # 3. Refresh OpenCV windows
-    # ---------------------------------------------------------
     if window_updated:
         cv2.waitKey(1)
-
 
 # Global variables for strict tap-based lane changes
 # Sequence for each one-lane movement:
@@ -986,6 +1152,7 @@ def send_controls_task():
     with data_lock:
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
         front_frame = shared_data.get('latest_front_frame')
+        front_frame_time = shared_data.get('front_frame_time', 0.0)
         run_summary = dict(shared_data.get('run_summary', {}))
 
     steering_input = 0.0
@@ -1003,6 +1170,22 @@ def send_controls_task():
         (front_frame.shape[1], front_frame.shape[0])
         if front_frame is not None else (640, 480)
     )
+
+    # Do not chase stale perception after a camera interruption.
+    if (
+        front_frame is None
+        or front_frame_time <= 0.0
+        or time.monotonic() - front_frame_time > STALE_FRONT_FRAME_SECONDS
+    ):
+        with data_lock:
+            shared_data['decision_debug'] = 'Reason: STALE_FRONT_FRAME | Hold lane safely'
+            shared_data['target_token_debug'] = None
+        try:
+            send_control_packet(0.0, 0.30)
+        except Exception:
+            pass
+        return
+
     maybe_record_collected_token(tokens_snapshot, img_w, img_h)
 
     green_collected = run_summary.get('green_collected', 0)
@@ -1029,8 +1212,10 @@ def send_controls_task():
     evaluated_tokens = []
     green_candidates = []
     for token in tokens_snapshot:
-        color = token.get('true_color', token.get('color'))
-        if color not in ['green', 'yellow', 'red']:
+        # Lane planning must use the currently visible type only. A token whose
+        # type was hidden by a yellow effect is treated as an unknown hazard.
+        color = get_visible_color(token)
+        if color not in ['green', 'yellow', 'red', 'hidden']:
             continue
 
         candidate = evaluate_token_candidate(
@@ -1041,10 +1226,20 @@ def send_controls_task():
 
         if (
             color == 'green'
+            and token.get('hits', 1) >= GREEN_CONFIRM_FRAMES
             and token['y'] >= TOKEN_DECISION_Y_MIN
             and candidate['reachable']
         ):
             green_candidates.append(candidate)
+
+    # A green reward never overrides a red, yellow or unknown token blocking
+    # the driving corridor. This is a hard safety veto rather than a soft score.
+    green_candidates = [
+        candidate for candidate in green_candidates
+        if not lane_has_blocking_hazard(
+            candidate, tokens_snapshot, current_lane, img_w, img_h
+        )
+    ]
 
     chosen_target_lane = None
     active_green_candidate = None
@@ -1074,9 +1269,15 @@ def send_controls_task():
         last_token_lane = chosen_target_lane
         last_token_time = now
         decision_reason = 'COLLECT_GREEN'
-    elif last_token_lane is not None and now - last_token_time < TOKEN_TARGET_MEMORY_SECONDS:
+    elif (
+        last_token_lane is not None
+        and now - last_token_time < TOKEN_TARGET_MEMORY_SECONDS
+        and not lane_has_imminent_hazard(
+            last_token_lane, tokens_snapshot, img_w, img_h
+        )
+    ):
         # Brief memory prevents a lane change from being aborted by one missed
-        # contour, while the short timeout limits stale-target behaviour.
+        # contour, but a newly visible hazard always cancels stale green memory.
         chosen_target_lane = last_token_lane
         decision_reason = 'GREEN_MEMORY'
     else:
@@ -1164,6 +1365,9 @@ def send_controls_task():
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
 if __name__ == '__main__':
+    token_tracks.clear()
+    next_token_track_id = 1
+    last_processed_front_seq = -1
     current_lane = START_LANE
     steering_state = 0
     tap_loop_count = 0
