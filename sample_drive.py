@@ -1333,6 +1333,10 @@ def send_controls_task():
     
     with data_lock:
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
+        if not shared_data.get('police_active', False):
+            tokens_snapshot = [
+                t for t in tokens_snapshot if t.get('color') != 'red'
+        ]
         front_frame = shared_data.get('latest_front_frame')
         run_summary = shared_data.get('run_summary', {})
         green_streak = run_summary.get('green_collected', 0)
