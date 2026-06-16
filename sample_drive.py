@@ -1119,10 +1119,12 @@ def processing_task():
                         shared_data['run_summary']['light_recovered'] = True
                         print(f"[LIGHT] ✅ LIGHT RESTORED! Brightness: {current_brightness:.1f}")
                     
-                    # Update baseline when not in dark mode
+                    # Update baseline: fast when normal, very slow when in dark mode to recover from false positives
                     if not low_light_active:
                         baseline = baseline * 0.97 + current_brightness * 0.03
-                        shared_data['brightness_baseline'] = baseline
+                    else:
+                        baseline = baseline * 0.99 + current_brightness * 0.01
+                    shared_data['brightness_baseline'] = baseline
                     
                     shared_data['brightness_last'] = current_brightness
                     shared_data['lights_on'] = not low_light_active
@@ -1142,7 +1144,7 @@ def processing_task():
                 if low_light_active:
                     for token in tokens:
                         token['true_color'] = token['color']
-                        token['color'] = 'yellow'
+                        token['color'] = 'hidden'
                 
                 tokens = apply_token_visibility_effects(tokens)
                 
