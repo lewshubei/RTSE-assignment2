@@ -13,6 +13,9 @@ import random
 # Configuration
 # ---------------------------------------------------------
 CAMERA_HOST = '127.0.0.1'
+CAMERA_READ_TIMEOUT = 0.05
+DISPLAY_WIDTH = 640
+DISPLAY_HEIGHT = 480
 FRONT_CAMERA_PORT = 8080
 BACK_CAMERA_PORT = 8082
 CONTROL_HOST = '127.0.0.1'
@@ -117,6 +120,8 @@ shared_data.update({
     'brightness_last': 0.0,
     'trailing_streak': 0,
     'police_streak': 0,
+    'display_front_frame': None,
+    'display_back_frame': None,
 })
 data_lock = threading.Lock()
 is_running = True
@@ -295,12 +300,14 @@ def read_single_camera(sock, window_name, data_key, display=True):
         
     try:
         latest_frame_data = None
-        sock.settimeout(None)
+        sock.settimeout(CAMERA_READ_TIMEOUT)
         length_bytes = sock.recv(4)
         if not length_bytes:
             return
             
         image_length = int.from_bytes(length_bytes, 'little')
+        if image_length <= 0 or image_length > 10_000_000:
+            return
         received_bytes = b''
         while len(received_bytes) < image_length and is_running:
             packet = sock.recv(image_length - len(received_bytes))
@@ -316,11 +323,12 @@ def read_single_camera(sock, window_name, data_key, display=True):
             if not readable:
                 break
                 
-            sock.settimeout(1.0)
             length_bytes = sock.recv(4)
             if not length_bytes:
                 return
             image_length = int.from_bytes(length_bytes, 'little')
+            if image_length <= 0 or image_length > 10_000_000:
+                break
             received_bytes = b''
             while len(received_bytes) < image_length and is_running:
                 packet = sock.recv(image_length - len(received_bytes))
@@ -339,13 +347,13 @@ def read_single_camera(sock, window_name, data_key, display=True):
                     shared_data[data_key] = frame
                 
                 if display:
-                    # You may disable this if you don't need to display the frames / This could effect the fps
-                    frame_resized = cv2.resize(frame, (640, 480))
+                    frame_resized = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
                     cv2.imshow(window_name, frame_resized)
-                    cv2.waitKey(1)
                 
-    except Exception as e:
-        pass
+    except socket.timeout:
+        return
+    except Exception:
+        return
 
 def read_front_camera_task():
     read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame', display=False)
@@ -889,6 +897,26 @@ def send_control_packet(steering_input, acceleration_input):
             break
     control_conn.sendall(delayed_data)
 
+def make_camera_placeholder(title, status):
+    frame = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+    cv2.putText(frame, title, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, status, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2)
+    cv2.putText(frame, "Start SpeedTrials2D.exe after this script", (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
+    return frame
+
+def update_camera_windows():
+    with data_lock:
+        front_disp = shared_data.get('display_front_frame')
+        back_disp = shared_data.get('display_back_frame')
+    if front_disp is None:
+        front_disp = make_camera_placeholder("Front Camera", "Waiting for controller...")
+    if back_disp is None:
+        back_disp = make_camera_placeholder("Back Camera", "Waiting for controller...")
+    cv2.imshow("Front Camera", front_disp)
+    cv2.imshow("Back Camera", back_disp)
+    cv2.waitKey(1)
+
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
     #You can use libraries like OpenCV to process the image
@@ -896,117 +924,126 @@ def processing_task():
     #Remember to use the shared_data to get the latest frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
-    with data_lock:
         back_frame = shared_data.get('latest_back_frame')
+        front_connected = front_camera_sock is not None
+        back_connected = back_camera_sock is not None
 
     if front_frame is not None:
-        processed_front_frame = apply_camera_effects(front_frame)
-        tokens = detect_colored_tokens(processed_front_frame)
-        tokens = apply_token_visibility_effects(tokens)
-
-        # Liz added: Challenge 1 — low-light detection via front-camera brightness
         try:
-            gray_full = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
-            brightness = float(np.mean(gray_full))
-            with data_lock:
-                baseline = shared_data.get('brightness_baseline')
-                was_dark = shared_data.get('low_light_active', False)
-                already_recovered = shared_data.get('low_light_recovered', False)
-                elapsed = (time.time() - run_start_time) if run_start_time else 999.0
-                in_event_window = elapsed <= LOWLIGHT_EVENT_WINDOW_SECONDS
-                if baseline is None:
-                    baseline = brightness
-                if baseline > brightness * 1.35 and brightness >= LOWLIGHT_MIN_BASELINE:
-                    baseline = brightness
-                candidate_dark = was_dark
-                if brightness >= max(baseline * LOWLIGHT_RECOVER_RATIO, LOWLIGHT_ABSOLUTE_MAX):
-                    candidate_dark = False
-                elif (brightness < LOWLIGHT_ABSOLUTE_MAX
-                        and baseline >= LOWLIGHT_MIN_BASELINE
-                        and brightness < baseline * LOWLIGHT_DARK_RATIO):
-                    candidate_dark = True
-                if candidate_dark:
-                    if was_dark or (in_event_window and not already_recovered):
-                        is_dark = True
+            processed_front_frame = apply_camera_effects(front_frame)
+            tokens = detect_colored_tokens(processed_front_frame)
+            tokens = apply_token_visibility_effects(tokens)
+
+            # Liz added: Challenge 1 — low-light detection via front-camera brightness
+            try:
+                gray_full = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
+                brightness = float(np.mean(gray_full))
+                with data_lock:
+                    baseline = shared_data.get('brightness_baseline')
+                    was_dark = shared_data.get('low_light_active', False)
+                    already_recovered = shared_data.get('low_light_recovered', False)
+                    elapsed = (time.time() - run_start_time) if run_start_time else 999.0
+                    in_event_window = elapsed <= LOWLIGHT_EVENT_WINDOW_SECONDS
+                    if baseline is None:
+                        baseline = brightness
+                    if baseline > brightness * 1.35 and brightness >= LOWLIGHT_MIN_BASELINE:
+                        baseline = brightness
+                    candidate_dark = was_dark
+                    if brightness >= max(baseline * LOWLIGHT_RECOVER_RATIO, LOWLIGHT_ABSOLUTE_MAX):
+                        candidate_dark = False
+                    elif (brightness < LOWLIGHT_ABSOLUTE_MAX
+                            and baseline >= LOWLIGHT_MIN_BASELINE
+                            and brightness < baseline * LOWLIGHT_DARK_RATIO):
+                        candidate_dark = True
+                    if candidate_dark:
+                        if was_dark or (in_event_window and not already_recovered):
+                            is_dark = True
+                        else:
+                            is_dark = False
                     else:
                         is_dark = False
-                else:
-                    is_dark = False
-                    if was_dark:
-                        shared_data['low_light_recovered'] = True
-                if not is_dark:
-                    sample = min(brightness, baseline * LOWLIGHT_BASELINE_MAX_RISE)
-                    baseline = (1.0 - LOWLIGHT_BASELINE_ALPHA) * baseline + LOWLIGHT_BASELINE_ALPHA * sample
-                shared_data['brightness_baseline'] = baseline
-                shared_data['brightness_last'] = brightness
-                shared_data['low_light_active'] = is_dark
-                shared_data['lights_on'] = not is_dark
-            if is_dark:
-                tokens = []
-            if debug_should_log('brightness'):
-                elapsed = (time.time() - run_start_time) if run_start_time else -1.0
-                debug_session_log('sample_drive.py:processing_task',
-                              'front brightness sample',
-                              {'brightness': round(brightness, 2),
-                               'baseline': round(baseline, 2),
-                               'is_dark': is_dark,
-                               'tokens': len(tokens),
-                               'elapsed_s': round(elapsed, 2)},
-                              'A,B',
-                              run_id='verify')
+                        if was_dark:
+                            shared_data['low_light_recovered'] = True
+                    if not is_dark:
+                        sample = min(brightness, baseline * LOWLIGHT_BASELINE_MAX_RISE)
+                        baseline = (1.0 - LOWLIGHT_BASELINE_ALPHA) * baseline + LOWLIGHT_BASELINE_ALPHA * sample
+                    shared_data['brightness_baseline'] = baseline
+                    shared_data['brightness_last'] = brightness
+                    shared_data['low_light_active'] = is_dark
+                    shared_data['lights_on'] = not is_dark
+                if is_dark:
+                    tokens = []
+                if debug_should_log('brightness'):
+                    elapsed = (time.time() - run_start_time) if run_start_time else -1.0
+                    debug_session_log('sample_drive.py:processing_task',
+                                  'front brightness sample',
+                                  {'brightness': round(brightness, 2),
+                                   'baseline': round(baseline, 2),
+                                   'is_dark': is_dark,
+                                   'tokens': len(tokens),
+                                   'elapsed_s': round(elapsed, 2)},
+                                  'A,B',
+                                  run_id='verify')
+            except Exception:
+                pass
+
+            with data_lock:
+                shared_data['detected_tokens'] = tokens
+
+            debug_frame = draw_detected_tokens(processed_front_frame, tokens)
+            with data_lock:
+                if shared_data.get('low_light_active', False):
+                    cv2.putText(debug_frame, "LOW LIGHT: tokens unknown", (10, 100),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
+            effect = get_active_yellow_effect()
+            if effect:
+                cv2.putText(debug_frame, f"Yellow Effect: {effect}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            with data_lock:
+                decision_debug = shared_data.get('decision_debug', '')
+            cv2.putText(debug_frame, f"Tokens: {len(tokens)}", (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(debug_frame, decision_debug[:95], (10, 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            debug_frame = cv2.resize(debug_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            with data_lock:
+                shared_data['display_front_frame'] = debug_frame.copy()
         except Exception:
-            pass
-
+            front_status = "Connected - waiting for video stream..." if front_connected else "Not connected yet"
+            with data_lock:
+                shared_data['display_front_frame'] = make_camera_placeholder("Front Camera", front_status)
+    else:
+        front_status = "Connected - waiting for video stream..." if front_connected else "Not connected yet"
         with data_lock:
-            shared_data['detected_tokens'] = tokens
-
-        debug_frame = draw_detected_tokens(processed_front_frame, tokens)
-        with data_lock:
-            if shared_data.get('low_light_active', False):
-                cv2.putText(debug_frame, "LOW LIGHT: tokens unknown", (10, 100),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
-        effect = get_active_yellow_effect()
-        if effect:
-            cv2.putText(debug_frame, f"Yellow Effect: {effect}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        with data_lock:
-            decision_debug = shared_data.get('decision_debug', '')
-        cv2.putText(debug_frame, f"Tokens: {len(tokens)}", (10, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        cv2.putText(debug_frame, decision_debug[:95], (10, 78),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        debug_frame = cv2.resize(debug_frame, (640, 480))
-        cv2.imshow("Front Camera", debug_frame)
-        cv2.waitKey(1)
+            shared_data['display_front_frame'] = make_camera_placeholder("Front Camera", front_status)
 
     # Run trailing / police detection on back camera
     if back_frame is not None:
-        trailing_raw, police_raw, area, bbox = detect_trailing_and_police(back_frame)
-        with data_lock:
-            if trailing_raw:
-                shared_data['trailing_streak'] = shared_data.get('trailing_streak', 0) + 1
-            else:
-                shared_data['trailing_streak'] = 0
-            if police_raw:
-                shared_data['police_streak'] = shared_data.get('police_streak', 0) + 1
-            else:
-                shared_data['police_streak'] = 0
-            trailing = shared_data['trailing_streak'] >= TRAILING_CONFIRM_FRAMES
-            police = shared_data['police_streak'] >= POLICE_CONFIRM_FRAMES
-            shared_data['trailing_detected'] = trailing
-            shared_data['police_detected'] = police
-            shared_data['danger_detected'] = trailing
-            
-            if police:
-                shared_data['run_summary']['police_appeared'] = True
-            if trailing:
-                shared_data['run_summary']['trailing_appeared'] = True
-
-        dbg = cv2.resize(back_frame.copy(), (640, 480))
         try:
-            scale_x = 640.0 / back_frame.shape[1]
-            scale_y = 480.0 / back_frame.shape[0]
+            trailing_raw, police_raw, area, bbox = detect_trailing_and_police(back_frame)
+            with data_lock:
+                if trailing_raw:
+                    shared_data['trailing_streak'] = shared_data.get('trailing_streak', 0) + 1
+                else:
+                    shared_data['trailing_streak'] = 0
+                if police_raw:
+                    shared_data['police_streak'] = shared_data.get('police_streak', 0) + 1
+                else:
+                    shared_data['police_streak'] = 0
+                trailing = shared_data['trailing_streak'] >= TRAILING_CONFIRM_FRAMES
+                police = shared_data['police_streak'] >= POLICE_CONFIRM_FRAMES
+                shared_data['trailing_detected'] = trailing
+                shared_data['police_detected'] = police
+                shared_data['danger_detected'] = trailing
+                
+                if police:
+                    shared_data['run_summary']['police_appeared'] = True
+                if trailing:
+                    shared_data['run_summary']['trailing_appeared'] = True
+
+            dbg = cv2.resize(back_frame.copy(), (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            scale_x = DISPLAY_WIDTH / back_frame.shape[1]
+            scale_y = DISPLAY_HEIGHT / back_frame.shape[0]
             if bbox is not None and trailing:
                 x, y, w, h = bbox
                 cv2.rectangle(
@@ -1029,10 +1066,16 @@ def processing_task():
             ]
             for idx, line in enumerate(lines):
                 cv2.putText(dbg, line, (10, 30 + idx * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            with data_lock:
+                shared_data['display_back_frame'] = dbg.copy()
         except Exception:
-            pass
-        cv2.imshow("Back Camera", dbg)
-        cv2.waitKey(1)
+            back_status = "Connected - waiting for video stream..." if back_connected else "Not connected yet"
+            with data_lock:
+                shared_data['display_back_frame'] = make_camera_placeholder("Back Camera", back_status)
+    else:
+        back_status = "Connected - waiting for video stream..." if back_connected else "Not connected yet"
+        with data_lock:
+            shared_data['display_back_frame'] = make_camera_placeholder("Back Camera", back_status)
 
 # def send_controls_task():
 #     #This is where you send the control commands to the car using the control_conn
@@ -1600,8 +1643,12 @@ if __name__ == '__main__':
 
     cv2.namedWindow("Front Camera", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Back Camera", cv2.WINDOW_NORMAL)
+    with data_lock:
+        shared_data['display_front_frame'] = make_camera_placeholder("Front Camera", "Starting controller...")
+        shared_data['display_back_frame'] = make_camera_placeholder("Back Camera", "Starting controller...")
     cv2.moveWindow("Front Camera", 40, 40)
     cv2.moveWindow("Back Camera", 700, 40)
+    update_camera_windows()
 
     print("Initializing RTSE Sample Drive...")
 
@@ -1625,7 +1672,8 @@ if __name__ == '__main__':
 
     try:
         while is_running:
-            time.sleep(1)
+            update_camera_windows()
+            time.sleep(0.01)
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
