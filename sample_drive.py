@@ -850,15 +850,18 @@ def get_lane_center_x(lane, frame_width):
     lane_width = frame_width / 5.0
     return (lane + 2) * lane_width + lane_width / 2.0
 
-def get_safe_lane(current_lane, hazard_lanes, frame_width):
+def get_safe_lane(current_lane, hazard_lanes, frame_width, bonus_lanes=None):
     """Find the safest lane to move to avoiding hazards"""
+    if bonus_lanes is None:
+        bonus_lanes = set()
+        
     available_lanes = [l for l in range(-2, 3) if l not in hazard_lanes]
     if not available_lanes:
         return current_lane
     
     # Prefer lanes further from hazards
     best_lane = current_lane
-    best_distance = -1
+    best_score = -1
     
     for lane in available_lanes:
         # Calculate distance from current lane
@@ -867,10 +870,13 @@ def get_safe_lane(current_lane, hazard_lanes, frame_width):
         edge_bonus = 1.0 if abs(lane) == 2 else 0.5
         score = dist * edge_bonus
         
-        if score > best_distance:
-            best_distance = score
+        if lane in bonus_lanes:
+            score += 100.0  # Massive priority for bonus lanes
+        
+        if score > best_score:
+            best_score = score
             best_lane = lane
-    
+            
     return best_lane
 
 def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane, front_frame):
@@ -1359,13 +1365,22 @@ def send_controls_task():
         t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
         hazard_lanes.add(t_lane)
 
+    # Detect green/yellow tokens for opportunity-aware evasion
+    green_tokens_for_bonus = [t for t in tokens_snapshot if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN]
+    yellow_tokens_for_bonus = [t for t in tokens_snapshot if t.get('color') == 'yellow' and t['y'] >= TOKEN_DECISION_Y_MIN]
+    bonus_tokens = green_tokens_for_bonus if green_tokens_for_bonus else yellow_tokens_for_bonus
+    bonus_lanes = set()
+    for t in bonus_tokens:
+        t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
+        bonus_lanes.add(t_lane)
+
     # =========================================================
     # EMERGENCY EVASION - Police car in same lane (front)
     # =========================================================
     if police_detected and police_lane is not None and police_lane == current_lane:
         print(f"[POLICE] ⚠️ Police car in lane {police_lane}! EVADING!")
         # Find safe lane to move to
-        safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w)
+        safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
         if safe_lane != current_lane:
             steering_input = 1.0 if safe_lane > current_lane else -1.0
             acceleration_input = min(acceleration_input, 0.65)
@@ -1400,7 +1415,7 @@ def send_controls_task():
                     acceleration_input = CAR_ACCELERATION * 0.5
         
         # Find safe lane to move to
-        safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w)
+        safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
         if safe_lane != current_lane:
             steering_input = 1.0 if safe_lane > current_lane else -1.0
             acceleration_input = min(acceleration_input, 0.65)
@@ -1525,13 +1540,27 @@ def send_controls_task():
         target_tokens = green_tokens if green_tokens else yellow_tokens
         
         if target_tokens:
-            # Go towards the nearest token
-            target = max(target_tokens, key=lambda t: t['y'])
-            target_lane = lane_from_x(target['x'], target['y'], frame_width=img_w, frame_height=img_h)
+            # PATH PLANNING - Group tokens by lane and calculate density
+            lane_density = {}
+            lane_closest_token = {}
+            for t in target_tokens:
+                t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
+                if t_lane in hazard_lanes:
+                    continue
+                    
+                if t_lane not in lane_density:
+                    lane_density[t_lane] = 0
+                    lane_closest_token[t_lane] = t
+                lane_density[t_lane] += 1
+                
+                if t['y'] > lane_closest_token[t_lane]['y']:
+                    lane_closest_token[t_lane] = t
             
-            # Check if target lane has red tokens (avoid)
-            if target_lane not in hazard_lanes:
-                chosen_target_lane = max(-2, min(2, target_lane))
+            if lane_density:
+                # Find lane with highest density, break ties by closest token
+                best_target_lane = max(lane_density, key=lambda l: (lane_density[l], lane_closest_token[l]['y']))
+                target = lane_closest_token[best_target_lane]
+                chosen_target_lane = max(-2, min(2, best_target_lane))
                 
                 # Steer towards token
                 token_error = (target['x'] - (img_w / 2.0)) / (img_w / 2.0)
@@ -1545,8 +1574,8 @@ def send_controls_task():
                 
                 acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
             else:
-                # Target lane has red token, find safe lane
-                safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w)
+                # Target lanes have red tokens, find safe lane (no bonuses since no safe tokens)
+                safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, set())
                 if safe_lane != current_lane:
                     steering_input = 1.0 if safe_lane > current_lane else -1.0
                     acceleration_input = min(acceleration_input, 0.60)
