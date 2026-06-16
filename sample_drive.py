@@ -70,12 +70,13 @@ YELLOW_EFFECTS = [
     'corrupted_camera_input'
 ]
 
-# Light detection tunables - STABLE RECOVERY
-LOWLIGHT_DARK_THRESHOLD = 0.65
-LOWLIGHT_RECOVERY_THRESHOLD = 0.85
-LOWLIGHT_MIN_BASELINE = 40.0
+# Light detection tunables - FAST RECOVERY OPTIMIZED
+LOWLIGHT_DARK_THRESHOLD = 0.60  # Lower threshold for faster detection
+LOWLIGHT_RECOVERY_THRESHOLD = 0.70  # Lower threshold for faster recovery detection
+LOWLIGHT_MIN_BASELINE = 35.0
 LOWLIGHT_EVENT_WINDOW_SECONDS = 10.0
-LOWLIGHT_RECOVERY_INTERVAL = 1.5  # Wait 1.5 seconds between recovery attempts
+LOWLIGHT_RECOVERY_INTERVAL = 0.5  # Recovery every 0.5 seconds for faster response
+LOWLIGHT_FAST_RECOVERY_COUNT = 3  # Send 3 rapid signals for fast recovery
 
 # Trailing car detection tunables
 TRAILING_CONFIRM_FRAMES = 4
@@ -143,7 +144,8 @@ shared_data = {
     'police_triggered': False,
     'recovery_attempts': 0,
     'last_recovery_time': 0.0,
-    'recovery_completed': False
+    'recovery_completed': False,
+    'recovery_phase': 0  # 0=idle, 1=fast_recovery, 2=normal
 }
 data_lock = threading.Lock()
 is_running = True
@@ -720,6 +722,26 @@ def start_random_yellow_effect():
         if effect == 'hide_next_token_type':
             shared_data['hidden_next_token_type'] = True
 
+def send_fast_recovery_burst():
+    """
+    Send a fast recovery burst with proper timing to avoid freezing
+    """
+    global control_conn
+    
+    if control_conn is None:
+        return False
+    
+    try:
+        # Send rapid recovery signals with small delays
+        for i in range(LOWLIGHT_FAST_RECOVERY_COUNT):
+            data = struct.pack('ff', 0.0, -1.0)
+            control_conn.sendall(data)
+            time.sleep(0.05)  # Small delay between signals
+        return True
+    except Exception as e:
+        print(f"[LIGHT] Failed to send fast recovery: {e}")
+        return False
+
 def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane, front_frame):
     global locked_green_lane, locked_green_until, last_token_lane, last_token_time, committed_target_lane, committed_target_until, committed_target_reason
 
@@ -911,7 +933,7 @@ def processing_task():
             processed_front_frame = apply_camera_effects(front_frame)
             tokens = detect_colored_tokens(processed_front_frame)
             
-            # LIGHT DETECTION SYSTEM - STABLE
+            # LIGHT DETECTION SYSTEM - FAST RECOVERY
             try:
                 gray_full = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
                 current_brightness = float(np.mean(gray_full))
@@ -919,6 +941,7 @@ def processing_task():
                 with data_lock:
                     baseline = shared_data.get('brightness_baseline')
                     low_light_active = shared_data.get('low_light_active', False)
+                    recovery_phase = shared_data.get('recovery_phase', 0)
                     
                     # Initialize baseline
                     if baseline is None:
@@ -926,13 +949,17 @@ def processing_task():
                         shared_data['brightness_baseline'] = baseline
                         print(f"[LIGHT] Baseline brightness set to: {baseline:.1f}")
                     
-                    # Check if brightness dropped significantly
+                    # FAST DARKNESS DETECTION
                     is_dark = False
                     if baseline >= LOWLIGHT_MIN_BASELINE:
+                        # Primary detection - lower threshold for faster response
                         if current_brightness < baseline * LOWLIGHT_DARK_THRESHOLD:
                             is_dark = True
                             if not low_light_active:
-                                print(f"[LIGHT] DARKNESS DETECTED! Brightness: {current_brightness:.1f} < {baseline * LOWLIGHT_DARK_THRESHOLD:.1f}")
+                                print(f"[LIGHT] ⚡ DARKNESS DETECTED! Brightness: {current_brightness:.1f}")
+                                # Trigger fast recovery immediately
+                                shared_data['recovery_phase'] = 1
+                        # Stay dark until recovery threshold is met
                         elif low_light_active and current_brightness < baseline * LOWLIGHT_RECOVERY_THRESHOLD:
                             is_dark = True
                     
@@ -943,17 +970,17 @@ def processing_task():
                         shared_data['low_light_recovery_start_time'] = time.time()
                         shared_data['recovery_attempts'] = 0
                         shared_data['recovery_completed'] = False
-                        print(f"[LIGHT] LOW LIGHT ACTIVE! Brightness: {current_brightness:.1f}")
-                        print(f"[LIGHT] Tokens are UNKNOWN (will appear as yellow)")
+                        print(f"[LIGHT] 🔦 LOW LIGHT ACTIVE!")
+                        print(f"[LIGHT] 🚀 Triggering FAST RECOVERY mode...")
                     elif not is_dark and low_light_active:
                         shared_data['low_light_active'] = False
                         shared_data['low_light_recovered'] = True
                         shared_data['lights_on'] = True
                         shared_data['low_light_recovery_sent'] = False
                         shared_data['recovery_completed'] = True
+                        shared_data['recovery_phase'] = 0
                         shared_data['run_summary']['light_recovered'] = True
-                        print(f"[LIGHT] LIGHT RESTORED! Brightness: {current_brightness:.1f}")
-                        print(f"[LIGHT] Tokens are VISIBLE again!")
+                        print(f"[LIGHT] ✅ LIGHT RESTORED! Brightness: {current_brightness:.1f}")
                     
                     # Update baseline when not in dark mode
                     if not low_light_active:
@@ -969,6 +996,12 @@ def processing_task():
                         if not shared_data.get('light_event_triggered', False):
                             shared_data['light_event_triggered'] = True
                             print(f"[LIGHT] Light event triggered at {elapsed:.2f}s")
+                    
+                    # If still dark, ensure fast recovery is active
+                    if low_light_active and shared_data.get('low_light_recovery_sent', False):
+                        time_since_recovery = time.time() - shared_data.get('last_recovery_time', 0)
+                        if time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
+                            shared_data['recovery_phase'] = 1
                 
                 # When low light active, tokens become unknown (yellow)
                 if low_light_active:
@@ -988,9 +1021,9 @@ def processing_task():
             
             with data_lock:
                 if shared_data.get('low_light_active', False):
-                    cv2.putText(debug_frame, "LOW LIGHT - Tokens UNKNOWN", (10, 100),
+                    cv2.putText(debug_frame, "⚡ LOW LIGHT - FAST RECOVERY ⚡", (10, 100),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-                    cv2.putText(debug_frame, "Sending recovery signal...", (10, 120),
+                    cv2.putText(debug_frame, "Tokens UNKNOWN (yellow)", (10, 120),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 lights_on = shared_data.get('lights_on', True)
                 if not lights_on:
@@ -1100,6 +1133,7 @@ def send_controls_task():
         police_detected = shared_data.get('police_detected', False)
         low_light_active = shared_data.get('low_light_active', False)
         lights_on = shared_data.get('lights_on', True)
+        recovery_phase = shared_data.get('recovery_phase', 0)
 
     steering_input = 0.0
     acceleration_input = CAR_ACCELERATION 
@@ -1118,7 +1152,7 @@ def send_controls_task():
     maybe_record_collected_token(tokens_snapshot, img_w, img_h, current_lane, front_frame if front_frame is not None else np.zeros((img_h, img_w, 3), dtype=np.uint8))
 
     # =========================================================
-    # LIGHT RECOVERY SYSTEM - Send acceleration_input = -1.0 once
+    # FAST LIGHT RECOVERY SYSTEM - Optimized for speed
     # =========================================================
     if low_light_active:
         with data_lock:
@@ -1130,38 +1164,73 @@ def send_controls_task():
         
         # Check if light is restored
         if current_brightness > baseline * LOWLIGHT_RECOVERY_THRESHOLD:
-            print(f"[LIGHT] Light restored! Brightness: {current_brightness:.1f}")
+            print(f"[LIGHT] ✅ Light restored! Brightness: {current_brightness:.1f}")
             with data_lock:
                 shared_data['low_light_active'] = False
                 shared_data['lights_on'] = True
                 shared_data['low_light_recovery_sent'] = False
                 shared_data['recovery_completed'] = True
+                shared_data['recovery_phase'] = 0
                 shared_data['run_summary']['light_recovered'] = True
             return
         
-        # Send recovery signal only once, or if enough time has passed
+        # FAST RECOVERY MODE - Send recovery signals quickly
         time_since_recovery = time.time() - last_recovery_time
         
+        # Send recovery signal if needed
         if not recovery_sent or time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
-            # Send single recovery signal (not burst)
-            steering_input = 0.0
-            acceleration_input = -1.0
+            # Use fast recovery burst for speed
+            if recovery_phase == 1 or not recovery_sent:
+                # Fast recovery - send burst
+                steering_input = 0.0
+                acceleration_input = -1.0
+                
+                with data_lock:
+                    shared_data['low_light_recovery_sent'] = True
+                    shared_data['last_recovery_time'] = time.time()
+                    shared_data['recovery_attempts'] = recovery_attempts + 1
+                    shared_data['run_summary']['light_recovery_attempts'] = shared_data['run_summary'].get('light_recovery_attempts', 0) + 1
+                
+                print(f"[LIGHT] ⚡ FAST RECOVERY (attempt {recovery_attempts + 1})")
+                print(f"[LIGHT] Brightness: {current_brightness:.1f}")
+                
+                # Send fast recovery burst
+                for i in range(LOWLIGHT_FAST_RECOVERY_COUNT):
+                    try:
+                        send_control_packet(0.0, -1.0)
+                        time.sleep(0.03)
+                    except Exception:
+                        pass
+                
+                if debug_should_log('light_recovery'):
+                    debug_session_log('sample_drive.py:send_controls_task',
+                                  'LIGHT: fast recovery burst',
+                                  {'brightness': round(current_brightness, 2),
+                                   'baseline': round(baseline, 2) if baseline else None,
+                                   'attempt': recovery_attempts + 1},
+                                  'C',
+                                  run_id='verify')
+                return
             
-            with data_lock:
-                shared_data['low_light_recovery_sent'] = True
-                shared_data['last_recovery_time'] = time.time()
-                shared_data['recovery_attempts'] = recovery_attempts + 1
-                shared_data['run_summary']['light_recovery_attempts'] = shared_data['run_summary'].get('light_recovery_attempts', 0) + 1
-            
-            print(f"[LIGHT] Sending recovery signal (attempt {recovery_attempts + 1})")
-            print(f"[LIGHT] Brightness: {current_brightness:.1f}, Baseline: {baseline:.1f}")
-            
-            try:
-                send_control_packet(steering_input, acceleration_input)
-            except Exception as e:
-                print(f"Network error during recovery: {e}")
-                control_conn = None
-            return
+            else:
+                # Normal recovery - single signal
+                steering_input = 0.0
+                acceleration_input = -1.0
+                
+                with data_lock:
+                    shared_data['low_light_recovery_sent'] = True
+                    shared_data['last_recovery_time'] = time.time()
+                    shared_data['recovery_attempts'] = recovery_attempts + 1
+                    shared_data['run_summary']['light_recovery_attempts'] = shared_data['run_summary'].get('light_recovery_attempts', 0) + 1
+                
+                print(f"[LIGHT] Recovery attempt {recovery_attempts + 1}")
+                
+                try:
+                    send_control_packet(steering_input, acceleration_input)
+                except Exception as e:
+                    print(f"Network error during recovery: {e}")
+                    control_conn = None
+                return
         
         # While waiting, maintain minimal control
         steering_input = 0.0
@@ -1670,6 +1739,7 @@ if __name__ == '__main__':
         shared_data['recovery_attempts'] = 0
         shared_data['last_recovery_time'] = 0.0
         shared_data['recovery_completed'] = False
+        shared_data['recovery_phase'] = 0
         shared_data['run_summary']['light_recovery_attempts'] = 0
         shared_data['run_summary']['light_recovered'] = False
 
@@ -1686,7 +1756,7 @@ if __name__ == '__main__':
     print(" 🏁 SPEED TRIALS 2D - FULLY AUTONOMOUS DRIVER 🏁")
     print("="*60)
     print("\nFeatures Implemented:")
-    print("  - Light Detection & Recovery System")
+    print("  - Fast Light Detection & Recovery System (Burst Mode)")
     print("  - Trailing Car Avoidance")
     print("  - Police Car Detection & Red Token Seeking")
     print("\nInitializing...")
