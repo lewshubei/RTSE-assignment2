@@ -116,7 +116,7 @@ POLICE_SPLIT_RATIO_MAX = 0.75
 POLICE_MIN_RED_PIXELS = 200
 POLICE_MIN_BLUE_PIXELS = 200
 POLICE_CONFIDENCE_THRESHOLD = 0.50
-POLICE_RED_TARGET_START_SECONDS = 8.5
+POLICE_RED_TARGET_START_SECONDS = 0.0
 POLICE_EVENT_TIMEOUT_SECONDS = 10.0
 
 # HSV ranges for police car colors
@@ -2544,18 +2544,18 @@ def send_controls_task():
             control_conn = None
         return
 
-    if decision_reason == "MAINTAIN" and current_lane in red_hazard_lanes:
+    if decision_reason in ("MAINTAIN", "POLICE_RED_TOKEN") and (current_lane in red_hazard_lanes or desired_lane in red_hazard_lanes):
         safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
-        if safe_lane != current_lane:
+        if safe_lane != desired_lane:
             desired_lane = safe_lane
             decision_reason = "AVOID_RED"
             selected_target_type = "AVOID_RED"
             hazard_debug_tokens = red_hazard_tokens
             acceleration_input = min(acceleration_input, 0.80)
 
-    if decision_reason == "MAINTAIN" and current_lane in yellow_hazard_lanes:
+    if decision_reason in ("MAINTAIN", "POLICE_RED_TOKEN") and (current_lane in yellow_hazard_lanes or desired_lane in yellow_hazard_lanes):
         safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
-        if safe_lane != current_lane:
+        if safe_lane != desired_lane:
             desired_lane = safe_lane
             decision_reason = "AVOID_YELLOW"
             selected_target_type = "AVOID_YELLOW"
