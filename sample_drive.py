@@ -49,7 +49,7 @@ TOKEN_TARGET_MEMORY_SECONDS = 2.4
 GREEN_TARGET_LOCK_SECONDS = 2.8
 GREEN_TARGET_LOCK_FRAMES = 18
 GREEN_TARGET_MAX_MISSING_FRAMES = 5
-GREEN_DECISION_MIN_Y_RATIO = 0.25
+GREEN_DECISION_MIN_Y_RATIO = 0.10
 GREEN_PRE_TARGET_MAX_Y_RATIO = 0.75
 GREEN_COLLECT_Y_RATIO = 0.55
 GREEN_ROAD_X_MARGIN_RATIO = 0.12
@@ -1653,8 +1653,6 @@ def green_rejection_reason(token, frame_width, frame_height, current_lane, block
     token_lane = lane_from_x(x, y, frame_width=frame_width, frame_height=frame_height)
     if token_lane in blocked_lanes:
         return "blocked_by_hazard"
-    if abs(token_lane - current_lane) > 1 and y < frame_height * GREEN_PRE_TARGET_MAX_Y_RATIO:
-        return "unreachable_lane"
     return None
 
 def is_reachable_green_token(token, frame_width, frame_height, current_lane, blocked_lanes):
