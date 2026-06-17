@@ -531,9 +531,15 @@ def classify_token_roi(frame, x, y, radius):
     total = float(roi.shape[0] * roi.shape[1])
     green_mask = cv2.inRange(hsv, np.array((42, 45, 95), dtype=np.uint8), np.array((88, 255, 255), dtype=np.uint8))
     yellow_mask = cv2.inRange(hsv, np.array((16, 70, 105), dtype=np.uint8), np.array((38, 255, 255), dtype=np.uint8))
+
+    # IMPORTANT:
+    # Red token detection must not accept very saturated red pixels, because the
+    # red roadside / road border is strongly saturated. The real token is a
+    # pale pink/red gradient, so it is detected from the original frame with an
+    # upper saturation limit, same as the working v2.py logic.
     red_mask = cv2.bitwise_or(
-        cv2.inRange(hsv, np.array((0, 75, 95), dtype=np.uint8), np.array((12, 255, 255), dtype=np.uint8)),
-        cv2.inRange(hsv, np.array((168, 75, 95), dtype=np.uint8), np.array((179, 255, 255), dtype=np.uint8))
+        cv2.inRange(hsv, np.array((0, 20, 145), dtype=np.uint8), np.array((20, 200, 255), dtype=np.uint8)),
+        cv2.inRange(hsv, np.array((160, 20, 145), dtype=np.uint8), np.array((179, 200, 255), dtype=np.uint8))
     )
 
     scores = {
@@ -545,6 +551,7 @@ def classify_token_roi(frame, x, y, radius):
     if score < 0.12:
         return "unknown"
     return color
+
 
 def dedupe_token_detections(tokens):
     priority = {"green": 3, "yellow": 2, "red": 1}
@@ -617,13 +624,30 @@ def detect_token_circles_by_shape(frame):
     return tokens
 
 def detect_colored_tokens(frame):
+    """
+    Detect green, yellow, and red tokens from the front camera.
+
+    Fix for false RED detections on the road side:
+    - Green/yellow keep the latest-code HSV detection.
+    - Red is detected separately from the original frame.
+    - Red uses an upper saturation limit to reject the strongly saturated red
+      road border / roadside markings.
+    - Red contours are filtered using aspect ratio, circularity, and fill ratio
+      so thin road markings and irregular red car/road fragments are rejected.
+    """
     frame_h, frame_w = frame.shape[:2]
+    detected_tokens = []
+
+    # =====================================================
+    # 1) GREEN + YELLOW detection using latest-code ROI
+    # =====================================================
     roi_y1 = int(frame_h * TOKEN_ROI_Y_START)
     roi_y2 = int(frame_h * TOKEN_ROI_Y_END)
     roi_y1 = max(0, min(frame_h - 1, roi_y1))
     roi_y2 = max(roi_y1 + 1, min(frame_h, roi_y2))
 
     roi = frame[roi_y1:roi_y2, :]
+
     process_roi = roi
     scale = 1.0
     if frame_w > TOKEN_PROCESS_WIDTH:
@@ -631,29 +655,26 @@ def detect_colored_tokens(frame):
         process_roi = cv2.resize(roi, (TOKEN_PROCESS_WIDTH, process_h), interpolation=cv2.INTER_AREA)
         scale = frame_w / float(TOKEN_PROCESS_WIDTH)
 
-    hsv = cv2.cvtColor(process_roi, cv2.COLOR_BGR2HSV)
-
-    detected_tokens = []
+    hsv_bright = cv2.cvtColor(process_roi, cv2.COLOR_BGR2HSV)
     standard_kernel = np.ones((3, 3), np.uint8)
 
+    # Keep the latest-code green/yellow ranges, but remove red from this loop.
+    # Red is handled by the v2-style detector below.
     standard_color_ranges = {
         "green": [((42, 45, 95), (88, 255, 255))],
-        "yellow": [((16, 70, 105), (38, 255, 255))],
-        "red": [((0, 75, 95), (12, 255, 255)), ((168, 75, 95), (179, 255, 255))]
+        "yellow": [((16, 70, 105), (38, 255, 255))]
     }
 
     for color_name, ranges in standard_color_ranges.items():
         color_mask = None
-
         for lower, upper in ranges:
             current_mask = cv2.inRange(
-                hsv,
+                hsv_bright,
                 np.array(lower, dtype=np.uint8),
                 np.array(upper, dtype=np.uint8)
             )
             color_mask = current_mask if color_mask is None else cv2.bitwise_or(color_mask, current_mask)
 
-        _ = cv2.bitwise_and(process_roi, process_roi, mask=color_mask)
         color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, standard_kernel)
         color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, standard_kernel)
 
@@ -672,7 +693,7 @@ def detect_colored_tokens(frame):
                 continue
 
             circularity = 4 * np.pi * process_area / (perimeter * perimeter)
-            min_circularity = 0.46 if color_name in ("green", "red") else 0.58
+            min_circularity = 0.46 if color_name == "green" else 0.58
             if circularity < min_circularity:
                 continue
 
@@ -682,19 +703,10 @@ def detect_colored_tokens(frame):
             radius = radius * scale
             if radius <= 0:
                 continue
-            circle_fill_ratio = area / (np.pi * radius * radius)
-            if color_name == "red" and circle_fill_ratio < 0.43:
-                continue
             if center_y < frame_h * 0.20 or center_y > frame_h * 0.92:
                 continue
-            verified_color = classify_token_roi(frame, center_x, center_y, radius)
-            if verified_color != color_name:
-                continue
+
             x, y, width, height = cv2.boundingRect(cnt)
-            if height > 0:
-                aspect_ratio = width / float(height)
-                if color_name == "red" and not (0.58 <= aspect_ratio <= 1.55):
-                    continue
             x1 = max(0, min(frame_w - 1, int(x * scale)))
             y1 = max(0, min(frame_h - 1, int(y * scale + roi_y1)))
             x2 = max(0, min(frame_w - 1, int((x + width) * scale)))
@@ -710,10 +722,85 @@ def detect_colored_tokens(frame):
                 "source": "hsv"
             })
 
+    # =====================================================
+    # 2) RED detection using v2.py-style original-frame mask
+    # =====================================================
+    # Do NOT use gamma-corrected image for red. The red token is pale pink/red,
+    # while road-side red markings are highly saturated. The upper S limit is
+    # the key fix that stops roadside red from being treated as token.
+    hsv_original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    red_mask_1 = cv2.inRange(
+        hsv_original,
+        np.array((0, 20, 145), dtype=np.uint8),
+        np.array((20, 200, 255), dtype=np.uint8)
+    )
+    red_mask_2 = cv2.inRange(
+        hsv_original,
+        np.array((160, 20, 145), dtype=np.uint8),
+        np.array((179, 200, 255), dtype=np.uint8)
+    )
+    red_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
+
+    # Close first to reconnect the token gradient; then small open removes noise.
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    red_min_area = max(70.0, frame_w * frame_h * 0.00030)
+    red_max_area = frame_w * frame_h * 0.20
+
+    for cnt in red_contours:
+        area = cv2.contourArea(cnt)
+        if area < red_min_area or area > red_max_area:
+            continue
+
+        x, y, width, height = cv2.boundingRect(cnt)
+        if height == 0:
+            continue
+
+        aspect_ratio = width / float(height)
+        if not (0.58 <= aspect_ratio <= 1.55):
+            continue
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        (center_x, center_y), radius = cv2.minEnclosingCircle(cnt)
+        if radius <= 0:
+            continue
+
+        circle_fill_ratio = area / (np.pi * radius * radius)
+        if circularity < 0.46 or circle_fill_ratio < 0.43:
+            continue
+
+        # Ignore HUD and bottom-edge fragments.
+        if center_y < frame_h * 0.20 or center_y > frame_h * 0.92:
+            continue
+
+        detected_tokens.append({
+            "color": "red",
+            "x": int(center_x),
+            "y": int(center_y),
+            "radius": int(radius),
+            "area": float(area),
+            "bbox": (
+                max(0, min(frame_w - 1, int(x))),
+                max(0, min(frame_h - 1, int(y))),
+                max(0, min(frame_w - 1, int(x + width))),
+                max(0, min(frame_h - 1, int(y + height)))
+            ),
+            "source": "hsv"
+        })
+
     if ENABLE_HOUGH_CIRCLES:
         detected_tokens.extend(detect_token_circles_by_shape(frame))
 
     return dedupe_token_detections(detected_tokens)
+
 
 def draw_light_debug_overlay(frame, tokens, current_mode):
     token_counts = {"green": 0, "yellow": 0, "red": 0}
