@@ -1581,17 +1581,18 @@ def send_controls_task():
         # -----------------------------
         # STEP 1: COLLECT TOKENS
         # -----------------------------
+        # Ignore the sky. Only look at tokens on the road.
+        vp_y = img_h * 0.45 
+        
         green_tokens = [
             t for t in tokens_snapshot
-            if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN
+            if t.get('color') == 'green' and t['y'] >= vp_y
         ]
 
         hazard_tokens = [
             t for t in tokens_snapshot
-            if t.get('color') in ['red', 'yellow'] and t['y'] >= TOKEN_DECISION_Y_MIN
+            if t.get('color') in ['red', 'yellow'] and t['y'] >= vp_y
         ]
-
-        target_tokens = green_tokens
 
         # -----------------------------
         # STEP 2: LANE SCORING SYSTEM
@@ -1599,16 +1600,16 @@ def send_controls_task():
         lane_density = {lane: 0.0 for lane in range(-2, 3)}
         lane_closest_token = {}
 
-        for t in target_tokens:
+        for t in green_tokens:
             t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
-
             if t_lane in hazard_lanes:
                 continue
 
-            proximity = t['y'] / img_h
+            # Normalize proximity from the horizon (0.0) to the bumper (1.0)
+            proximity = (t['y'] - vp_y) / (img_h - vp_y)
 
-            # reward green tokens
-            lane_density[t_lane] += 1.0 + (proximity * 2.0)
+            # Exponential reward for closer green tokens
+            lane_density[t_lane] += 1.0 + (proximity ** 2) * 4.0
 
             if t_lane not in lane_closest_token:
                 lane_closest_token[t_lane] = t
@@ -1621,26 +1622,38 @@ def send_controls_task():
         # -----------------------------
         for h in hazard_tokens:
             h_lane = lane_from_x(h['x'], h['y'], frame_width=img_w, frame_height=img_h)
-            proximity = h['y'] / img_h
+            proximity = (h['y'] - vp_y) / (img_h - vp_y)
 
+            # Base penalties (cubed for immediate evasion of close hazards)
+            is_red = h.get('color') == 'red'
+            base_penalty = 8.0 if is_red else 10.0
+            prox_multiplier = 15.0 if is_red else 12.0
+            
+            total_penalty = base_penalty + (proximity ** 3) * prox_multiplier
+
+            # Apply massive penalty to the primary lane
             if h_lane in lane_density:
-                if h.get('color') == 'red':
-                    lane_density[h_lane] -= 6.0 + (proximity * 5.0)
-                elif h.get('color') == 'yellow':
-                    lane_density[h_lane] -= 8.0 + (proximity * 6.0)
+                lane_density[h_lane] -= total_penalty
+                
+            # Apply 'splash' penalty to adjacent lanes to prevent clipping edges
+            splash_penalty = total_penalty * 0.35
+            if h_lane - 1 in lane_density:
+                lane_density[h_lane - 1] -= splash_penalty
+            if h_lane + 1 in lane_density:
+                lane_density[h_lane + 1] -= splash_penalty
 
         # -----------------------------
         # STEP 4: CHOOSE BEST LANE
         # -----------------------------
-        valid_lanes = [l for l in lane_density.keys() if lane_density[l] > -5]
+        valid_lanes = [l for l in lane_density.keys() if lane_density[l] > -2.0]
 
         if valid_lanes:
             best_target_lane = max(valid_lanes, key=lambda l: lane_density[l])
         else:
+            # If all lanes are dangerous, use your existing safe_lane logic
             best_target_lane = current_lane
 
         target = lane_closest_token.get(best_target_lane, None)
-
         # -----------------------------
         # STEP 5: STEERING DECISION
         # -----------------------------
