@@ -1741,7 +1741,12 @@ def send_controls_task():
         ]
 
         if valid_lanes:
-            best_target_lane = max(valid_lanes, key=lambda l: lane_density[l])
+            best_lane = max(lane_density, key=lane_density.get)
+
+            if lane_density[best_lane] == 0:
+                best_target_lane = current_lane   
+            else:
+                best_target_lane = best_lane
         else:
             best_target_lane = get_safe_lane(current_lane, hazard_lanes, img_w, set())
 
