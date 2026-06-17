@@ -2602,23 +2602,9 @@ def send_controls_task():
             selected_target_type = "GREEN"
             acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
 
-            image_center_x = img_w / 2.0
-            prediction_scale = 1.0 + max(0.0, 1.0 - target_y_ratio) * GREEN_PREDICTION_GAIN
-            predicted_green_x = clamp(
-                image_center_x + ((selected_green_target['x'] - image_center_x) * prediction_scale),
-                0.0,
-                float(img_w - 1)
-            )
-            green_error = predicted_green_x - image_center_x
-            normalized_error = green_error / image_center_x
-            if abs(normalized_error) <= GREEN_CENTER_DEADZONE_RATIO:
-                green_direct_steer = 0.0
-            else:
-                steer_gain = GREEN_DIRECT_STEER_GAIN if decision_reason == "GREEN_TARGET" else GREEN_PRE_TARGET_STEER_GAIN
-                green_direct_steer = clamp(normalized_error * steer_gain, -1.0, 1.0)
             target_debug = (
                 f"green_target:{selected_green_target['x']},{selected_green_target['y']} "
-                f"pred:{int(predicted_green_x)} reach:{len(reachable_green_tokens)} lock:{locked_green_target_frames}"
+                f"reach:{len(reachable_green_tokens)} lock:{locked_green_target_frames}"
             )
         else:
             if previous_target and green_rejection_reason(previous_target, img_w, img_h, current_lane, hazard_lanes) is None and locked_green_target_missing_frames < GREEN_TARGET_MAX_MISSING_FRAMES:
@@ -2631,12 +2617,6 @@ def send_controls_task():
                 decision_reason = "GREEN_TARGET" if target_y_ratio >= GREEN_COLLECT_Y_RATIO else "PRE_TARGET_GREEN"
                 selected_target_type = "GREEN"
                 acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
-                image_center_x = img_w / 2.0
-                prediction_scale = 1.0 + max(0.0, 1.0 - target_y_ratio) * GREEN_PREDICTION_GAIN
-                predicted_green_x = clamp(image_center_x + ((selected_green_target['x'] - image_center_x) * prediction_scale), 0.0, float(img_w - 1))
-                normalized_error = (predicted_green_x - image_center_x) / image_center_x
-                steer_gain = GREEN_DIRECT_STEER_GAIN if decision_reason == "GREEN_TARGET" else GREEN_PRE_TARGET_STEER_GAIN
-                green_direct_steer = 0.0 if abs(normalized_error) <= GREEN_CENTER_DEADZONE_RATIO else clamp(normalized_error * steer_gain, -1.0, 1.0)
                 target_debug = f"green_lock_missing:{locked_green_target_missing_frames}/{GREEN_TARGET_MAX_MISSING_FRAMES} x:{selected_green_target['x']} y:{selected_green_target['y']}"
             else:
                 locked_green_target = None
