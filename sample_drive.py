@@ -403,6 +403,27 @@ def adjust_gamma(image, gamma=1.5):
                       for i in np.arange(256)]).astype("uint8")
     return cv2.LUT(image, table)
 
+def token_in_front_danger_zone(token, frame_width, frame_height):
+    """
+    Checks whether a token is directly in front of the player's vehicle.
+    This is used as an emergency collision check for red/yellow tokens.
+    """
+    y = token['y']
+    x = token['x']
+
+    # Only check tokens close to the vehicle
+    if y < frame_height * 0.55:
+        return False
+
+    y_ratio = y / frame_height
+
+    # Danger zone becomes wider near the bottom of the screen
+    half_width_ratio = 0.07 + 0.13 * ((y_ratio - 0.55) / 0.40)
+    half_width_ratio = max(0.07, min(0.20, half_width_ratio))
+
+    center_x = frame_width / 2.0
+    return abs(x - center_x) <= frame_width * half_width_ratio
+
 def detect_token_color_robust(frame, x, y, radius):
     x1 = max(int(x - radius), 0)
     y1 = max(int(y - radius), 0)
@@ -1333,10 +1354,6 @@ def send_controls_task():
     
     with data_lock:
         tokens_snapshot = list(shared_data.get('detected_tokens', []))
-        if not shared_data.get('police_active', False):
-            tokens_snapshot = [
-                t for t in tokens_snapshot if t.get('color') != 'red'
-        ]
         front_frame = shared_data.get('latest_front_frame')
         run_summary = shared_data.get('run_summary', {})
         green_streak = run_summary.get('green_collected', 0)
@@ -1347,7 +1364,6 @@ def send_controls_task():
         low_light_active = shared_data.get('low_light_active', False)
         lights_on = shared_data.get('lights_on', True)
         red_token_collected = shared_data.get('red_token_collected_during_police', False)
-        recovery_phase = shared_data.get('recovery_phase', 0)
         police_lane = shared_data.get('police_lane', None)
         trailing_lane = shared_data.get('trailing_lane', None)
 
@@ -1536,59 +1552,126 @@ def send_controls_task():
     # =========================================================
     # TOKEN DECISION - Seek GREEN tokens (only when no threats)
     # =========================================================
+    if not police_active and not police_detected and not trailing_detected:
+        danger_tokens_front = [
+            t for t in tokens_snapshot
+            if t.get('color') in ['red', 'yellow']
+            and token_in_front_danger_zone(t, img_w, img_h)
+        ]
+
+        if danger_tokens_front:
+            closest_danger = max(danger_tokens_front, key=lambda t: t['y'])
+
+            steering_input = -1.0 if closest_danger['x'] >= img_w / 2.0 else 1.0
+            acceleration_input = HAZARD_AVOID_MAX_ACCELERATION
+
+            with data_lock:
+                shared_data['decision_debug'] = f"FRONT DANGER OVERRIDE: {closest_danger['color']}"
+
+            send_control_packet(steering_input, acceleration_input)
+            return
     # Only seek green tokens if no police or trailing car detected
+    # =========================================================
+# TOKEN DECISION - GREEN PRIORITY WITH HAZARD AWARENESS
+# =========================================================
+
+# Only seek green tokens if no police or trailing car detected
     if not police_detected and not trailing_detected:
-        # Find green tokens - AVOID RED TOKENS
-        green_tokens = [t for t in tokens_snapshot if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN]
-        yellow_tokens = [t for t in tokens_snapshot if t.get('color') == 'yellow' and t['y'] >= TOKEN_DECISION_Y_MIN]
-        
-        # Prefer green tokens
-        target_tokens = green_tokens if green_tokens else yellow_tokens
-        
-        if target_tokens:
-            # PATH PLANNING - Group tokens by lane and calculate density
-            lane_density = {}
-            lane_closest_token = {}
-            for t in target_tokens:
-                t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
-                if t_lane in hazard_lanes:
-                    continue
-                    
-                if t_lane not in lane_density:
-                    lane_density[t_lane] = 0
-                    lane_closest_token[t_lane] = t
-                lane_density[t_lane] += 1
-                
+
+        # -----------------------------
+        # STEP 1: COLLECT TOKENS
+        # -----------------------------
+        green_tokens = [
+            t for t in tokens_snapshot
+            if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN
+        ]
+
+        hazard_tokens = [
+            t for t in tokens_snapshot
+            if t.get('color') in ['red', 'yellow'] and t['y'] >= TOKEN_DECISION_Y_MIN
+        ]
+
+        target_tokens = green_tokens
+
+        # -----------------------------
+        # STEP 2: LANE SCORING SYSTEM
+        # -----------------------------
+        lane_density = {lane: 0.0 for lane in range(-2, 3)}
+        lane_closest_token = {}
+
+        for t in target_tokens:
+            t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
+
+            if t_lane in hazard_lanes:
+                continue
+
+            proximity = t['y'] / img_h
+
+            # reward green tokens
+            lane_density[t_lane] += 1.0 + (proximity * 2.0)
+
+            if t_lane not in lane_closest_token:
+                lane_closest_token[t_lane] = t
+            else:
                 if t['y'] > lane_closest_token[t_lane]['y']:
                     lane_closest_token[t_lane] = t
-            
-            if lane_density:
-                # Find lane with highest density, break ties by closest token
-                best_target_lane = max(lane_density, key=lambda l: (lane_density[l], lane_closest_token[l]['y']))
-                target = lane_closest_token[best_target_lane]
-                chosen_target_lane = max(-2, min(2, best_target_lane))
-                
-                # Steer towards token
-                token_error = (target['x'] - (img_w / 2.0)) / (img_w / 2.0)
-                if abs(token_error) > TOKEN_CENTER_X_DEADZONE:
-                    visual_steer = max(-1.0, min(1.0, token_error * GREEN_STEER_GAIN))
-                    if abs(visual_steer) < GREEN_APPROACH_MIN_STEER:
-                        visual_steer = GREEN_APPROACH_MIN_STEER if visual_steer > 0 else -GREEN_APPROACH_MIN_STEER
-                    steering_input = visual_steer
-                else:
-                    steering_input = 1.0 if chosen_target_lane > current_lane else -1.0 if chosen_target_lane < current_lane else 0.0
-                
-                acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
-            else:
-                # Target lanes have red tokens, find safe lane (no bonuses since no safe tokens)
-                safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, set())
-                if safe_lane != current_lane:
-                    steering_input = 1.0 if safe_lane > current_lane else -1.0
-                    acceleration_input = min(acceleration_input, 0.60)
+
+        # -----------------------------
+        # STEP 3: APPLY HAZARD PENALTY
+        # -----------------------------
+        for h in hazard_tokens:
+            h_lane = lane_from_x(h['x'], h['y'], frame_width=img_w, frame_height=img_h)
+            proximity = h['y'] / img_h
+
+            if h_lane in lane_density:
+                if h.get('color') == 'red':
+                    lane_density[h_lane] -= 6.0 + (proximity * 5.0)
+                elif h.get('color') == 'yellow':
+                    lane_density[h_lane] -= 8.0 + (proximity * 6.0)
+
+        # -----------------------------
+        # STEP 4: CHOOSE BEST LANE
+        # -----------------------------
+        valid_lanes = [l for l in lane_density.keys() if lane_density[l] > -5]
+
+        if valid_lanes:
+            best_target_lane = max(valid_lanes, key=lambda l: lane_density[l])
         else:
-            # No tokens, maintain current lane
-            steering_input = 0.0
-            acceleration_input = CAR_ACCELERATION
+            best_target_lane = current_lane
+
+        target = lane_closest_token.get(best_target_lane, None)
+
+        # -----------------------------
+        # STEP 5: STEERING DECISION
+        # -----------------------------
+        if target is not None:
+            token_error = (target['x'] - (img_w / 2.0)) / (img_w / 2.0)
+
+            if abs(token_error) > TOKEN_CENTER_X_DEADZONE:
+                steering_input = max(-1.0, min(1.0, token_error * GREEN_STEER_GAIN))
+
+                if abs(steering_input) < GREEN_APPROACH_MIN_STEER:
+                    steering_input = GREEN_APPROACH_MIN_STEER if steering_input > 0 else -GREEN_APPROACH_MIN_STEER
+            else:
+                if best_target_lane > current_lane:
+                    steering_input = 1.0
+                elif best_target_lane < current_lane:
+                    steering_input = -1.0
+                else:
+                    steering_input = 0.0
+
+            acceleration_input = min(acceleration_input, GREEN_CHASE_ACCELERATION)
+
+        else:
+            # No safe green target
+            safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, set())
+
+            if safe_lane != current_lane:
+                steering_input = 1.0 if safe_lane > current_lane else -1.0
+                acceleration_input = min(acceleration_input, 0.60)
+            else:
+                steering_input = 0.0
+                acceleration_input = CAR_ACCELERATION
 
     # Calculate speed modifiers
     if lights_on:
