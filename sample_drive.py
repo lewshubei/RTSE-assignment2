@@ -9,6 +9,7 @@ import select
 import ctypes
 import random
 import os
+import json
 
 YOLO = None
 
@@ -84,6 +85,22 @@ DECISION_LOCK_SECONDS = 0.25
 HAZARD_DECISION_LOCK_SECONDS = 0.15
 CAMERA_DELAY_SECONDS = 5.0
 ACTION_DELAY_SECONDS = 5.0
+
+# New Game Day Settings
+GAME_DURATION_SECONDS = 180  # 3 minutes
+EVENT_ROTATION_INTERVAL = 60  # Events rotate every 60 seconds
+GOLDEN_LANE_DURATION = 5.0  # Golden lane effect duration
+TACTICAL_WIN_THRESHOLD = 60  # Net +60 green tokens required
+
+# Event timing (based on 60-second cycle)
+EVENT_TIMING = {
+    'darkness': {'start': 0, 'end': 30, 'duration': 30},
+    'police_car': {'start': 30, 'end': 50, 'duration': 20},
+    'chasing_car_a': {'start': 0, 'end': 30, 'duration': 30},
+    'chasing_car_b': {'start': 50, 'end': 60, 'duration': 10},
+    'golden_lane': {'start': 0, 'end': 55, 'duration': 55}
+}
+
 YELLOW_EFFECTS = [
     'hide_next_token_type',
     'tokens_invisible',
@@ -204,7 +221,15 @@ shared_data = {
         'trailing_appeared': False,
         'light_recovery_attempts': 0,
         'light_recovered': False,
-        'speed_penalties': 0
+        'speed_penalties': 0,
+        'events_passed': {
+            'darkness': False,
+            'police_car': False,
+            'chasing_car_a': False,
+            'chasing_car_b': False,
+            'golden_lane': False
+        },
+        'tactical_win_achieved': False
     },
     'active_yellow_effect': None,
     'yellow_effect_until': 0.0,
@@ -272,17 +297,24 @@ shared_data = {
     'hazard_debug': None,
     'speed_modifier': 1.0,
     'selected_target_type': 'NONE',
-    'current_mode': 'LANE FOLLOW'
+    'current_mode': 'LANE FOLLOW',
+    'golden_lane_active': False,
+    'golden_lane_number': 0,
+    'golden_lane_until': 0.0,
+    'golden_lane_passed': False,
+    'golden_lane_announce_time': 0.0,
+    'golden_lane_target_reached': False,
+    'golden_lane_approach_start': 0.0,
+    'current_event': None,
+    'event_start_time': 0.0,
+    'event_cycle_time': 0.0
 }
 data_lock = threading.Lock()
 is_running = True
 front_camera_delay_buffer = []
 action_delay_buffer = []
 
-# region debug instrumentation
-import os as _dbg_os
-import json as _dbg_json
-DEBUG_LOG_PATH = _dbg_os.path.join(_dbg_os.path.dirname(_dbg_os.path.abspath(__file__)), 'debug-a86f0d.log')
+DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'debug-a86f0d.log')
 _debug_log_lock = threading.Lock()
 _debug_log_times = {}
 
@@ -306,7 +338,7 @@ def debug_session_log(location, message, data, hypothesis_id, run_id='run1'):
             'data': data,
             'timestamp': int(time.time() * 1000),
         }
-        line = _dbg_json.dumps(entry)
+        line = json.dumps(entry)
         with _debug_log_lock:
             with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as _f:
                 _f.write(line + '\n')
@@ -551,7 +583,6 @@ def classify_token_roi(frame, x, y, radius):
     if score < 0.12:
         return "unknown"
     return color
-
 
 def dedupe_token_detections(tokens):
     priority = {"green": 3, "yellow": 2, "red": 1}
@@ -801,6 +832,66 @@ def detect_colored_tokens(frame):
 
     return dedupe_token_detections(detected_tokens)
 
+# Event Management Functions
+def get_event_for_time(elapsed):
+    """Get the current event based on elapsed time in the 60-second cycle"""
+    cycle_time = elapsed % EVENT_ROTATION_INTERVAL
+    
+    if 0 <= cycle_time < 30:
+        return 'darkness'
+    elif 30 <= cycle_time < 50:
+        return 'police_car'
+    elif 50 <= cycle_time < 60:
+        return 'chasing_car_b'
+    else:
+        return 'none'
+
+def get_golden_lane_for_time(elapsed):
+    """Check if golden lane is active and return lane number"""
+    cycle_time = elapsed % EVENT_ROTATION_INTERVAL
+    
+    # Golden lane is active from 0-55 seconds of each cycle
+    if 0 <= cycle_time <= 55:
+        # Random lane number between -2 and 2
+        lane = random.randint(-2, 2)
+        return lane
+    return None
+
+def is_event_active(event_name, elapsed):
+    """Check if a specific event is active at the given time"""
+    cycle_time = elapsed % EVENT_ROTATION_INTERVAL
+    
+    timing = EVENT_TIMING.get(event_name)
+    if not timing:
+        return False
+    
+    start = timing['start']
+    end = timing['end']
+    
+    # Handle events that wrap around the cycle
+    if start <= end:
+        return start <= cycle_time < end
+    else:
+        return cycle_time >= start or cycle_time < end
+
+def check_tactical_win_condition():
+    """Check if tactical win condition is met"""
+    with data_lock:
+        green = shared_data['run_summary'].get('green_collected', 0)
+        red = shared_data['run_summary'].get('red_collected', 0)
+        events_passed = shared_data['run_summary'].get('events_passed', {})
+        
+        net_green = green - red
+        
+        # Check if all events have been passed at least once
+        all_events_passed = all(events_passed.values())
+        
+        # Tactical win: net +60 green tokens AND passed all events at least once
+        if net_green >= TACTICAL_WIN_THRESHOLD and all_events_passed:
+            shared_data['run_summary']['tactical_win_achieved'] = True
+            return True
+        
+        return False
 
 def draw_light_debug_overlay(frame, tokens, current_mode):
     token_counts = {"green": 0, "yellow": 0, "red": 0}
@@ -811,6 +902,59 @@ def draw_light_debug_overlay(frame, tokens, current_mode):
         "hidden": (255, 255, 255)
     }
     frame_h, frame_w = frame.shape[:2]
+
+    # Draw golden lane overlay
+    with data_lock:
+        golden_active = shared_data.get('golden_lane_active', False)
+        golden_lane = shared_data.get('golden_lane_number', 0)
+        golden_passed = shared_data.get('golden_lane_passed', False)
+        golden_until = shared_data.get('golden_lane_until', 0.0)
+        golden_target_reached = shared_data.get('golden_lane_target_reached', False)
+        
+        if golden_active and not golden_passed:
+            # Highlight the golden lane
+            lane_width = frame_w / 5.0
+            lane_x = (golden_lane + 2) * lane_width
+            overlay = frame.copy()
+            
+            # Green if target reached, yellow if approaching
+            color = (0, 255, 0) if golden_target_reached else (0, 255, 255)
+            cv2.rectangle(overlay, 
+                         (int(lane_x), 0), 
+                         (int(lane_x + lane_width), frame_h), 
+                         color, -1)
+            cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+            
+            # Show golden lane info
+            if golden_target_reached:
+                cv2.putText(frame, f"⭐ ON GOLDEN LANE {golden_lane} ⭐", (frame_w//2 - 180, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(frame, f"⭐ MOVE TO LANE {golden_lane} ⭐", (frame_w//2 - 180, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Show countdown
+            remaining = max(0, golden_until - time.time())
+            cv2.putText(frame, f"Time: {remaining:.1f}s", (frame_w//2 - 60, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            
+            # Show lane indicator arrow
+            arrow_y = frame_h - 100
+            if golden_target_reached:
+                cv2.putText(frame, "✅", (frame_w//2 - 10, arrow_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
+            else:
+                # Arrow pointing to golden lane
+                current_lane_x = (current_lane + 2) * lane_width + lane_width/2
+                if golden_lane > current_lane:
+                    cv2.putText(frame, ">>>", (frame_w//2 + 20, arrow_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+                elif golden_lane < current_lane:
+                    cv2.putText(frame, "<<<", (frame_w//2 - 80, arrow_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+                else:
+                    cv2.putText(frame, "✅", (frame_w//2 - 10, arrow_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
 
     for token in tokens:
         color_name = token.get("color")
@@ -858,6 +1002,8 @@ def draw_light_debug_overlay(frame, tokens, current_mode):
             'low': shared_data.get('low_light_active', False),
             'yellow_effect': shared_data.get('active_yellow_effect')
         }
+        current_event = shared_data.get('current_event', 'none')
+        golden_active = shared_data.get('golden_lane_active', False)
 
     if green_target_debug:
         target_x = int(green_target_debug.get('x', frame_w // 2))
@@ -905,12 +1051,24 @@ def draw_light_debug_overlay(frame, tokens, current_mode):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
     cv2.putText(frame, f"Collected G:{summary.get('green_collected', 0)} R:{summary.get('red_collected', 0)} Y:{summary.get('yellow_collected', 0)}", (10, 116),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
-    event_text = (
-        f"Events T:{int(event_status['trailing'])} P:{int(event_status['police'])} "
-        f"Low:{int(event_status['low'])} YFX:{event_status['yellow_effect'] or 'none'}"
-    )
-    cv2.putText(frame, event_text, (10, 138),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    
+    # Show tactical win progress
+    if net_green >= TACTICAL_WIN_THRESHOLD:
+        cv2.putText(frame, "🏆 TACTICAL WIN READY! 🏆", (10, 138),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    
+    # Show event status
+    events_passed = summary.get('events_passed', {})
+    event_text = f"Events: D:{int(events_passed.get('darkness', False))} P:{int(events_passed.get('police_car', False))} C:{int(events_passed.get('chasing_car_a', False))} CB:{int(events_passed.get('chasing_car_b', False))} G:{int(events_passed.get('golden_lane', False))}"
+    cv2.putText(frame, event_text, (10, 160),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
+    
+    # Show current event
+    elapsed = time.time() - (run_start_time if run_start_time else 0)
+    cycle_time = elapsed % EVENT_ROTATION_INTERVAL
+    cv2.putText(frame, f"Cycle: {int(cycle_time)}s Event: {current_event}", (10, 182),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
+    
     if decision_debug:
         cv2.putText(frame, decision_debug[:110], (10, 160),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
@@ -1697,6 +1855,27 @@ def select_green_target(green_tokens, previous_target, frame_width, frame_height
 
     return max(reachable, key=lambda t: green_target_score(t, frame_width, frame_height, current_lane)), reachable
 
+# Global variables for steering state machine
+steering_state = 0
+tap_loop_count = 0
+current_lane = START_LANE
+last_token_lane = None
+last_token_time = 0.0
+locked_green_lane = None
+locked_green_until = 0.0
+committed_target_lane = None
+committed_target_until = 0.0
+committed_target_reason = "MAINTAIN"
+last_token_debug_time = 0.0
+run_start_time = None
+trailing_dodge_lane = None
+trailing_dodge_until = 0.0
+last_trailing_notice = None
+last_police_notice = None
+locked_green_target = None
+locked_green_target_frames = 0
+locked_green_target_missing_frames = 0
+
 def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane, front_frame):
     global locked_green_lane, locked_green_until, last_token_lane, last_token_time, committed_target_lane, committed_target_until, committed_target_reason, locked_green_target, locked_green_target_frames, locked_green_target_missing_frames
 
@@ -1933,7 +2112,62 @@ def processing_task():
             
             tokens = merge_token_detections(hsv_tokens)
             
-            # SUPER FAST LIGHT DETECTION - Check brightness every frame
+            # Update event tracking
+            with data_lock:
+                elapsed = time.time() - (run_start_time if run_start_time else 0)
+                current_event = get_event_for_time(elapsed)
+                shared_data['current_event'] = current_event
+                shared_data['event_cycle_time'] = elapsed % EVENT_ROTATION_INTERVAL
+                
+                # Check if current event has been passed
+                if current_event != 'none':
+                    event_passed = shared_data['run_summary']['events_passed'].get(current_event, False)
+                    if not event_passed:
+                        # For golden lane, we need to be on the lane when timer expires
+                        if current_event == 'golden_lane':
+                            golden_lane = get_golden_lane_for_time(elapsed)
+                            if golden_lane is not None:
+                                # Check if we're on the golden lane
+                                if current_lane == golden_lane:
+                                    # We're on the lane, mark as passed if timer expired
+                                    golden_until = shared_data.get('golden_lane_until', 0.0)
+                                    if time.time() >= golden_until:
+                                        shared_data['golden_lane_passed'] = True
+                                        shared_data['run_summary']['events_passed']['golden_lane'] = True
+                                        print(f"[GOLDEN] Golden lane {golden_lane} passed!")
+                        else:
+                            # Other events are passed if we survive them
+                            timing = EVENT_TIMING.get(current_event, {})
+                            event_end = timing.get('end', 0)
+                            if elapsed % EVENT_ROTATION_INTERVAL > event_end:
+                                shared_data['run_summary']['events_passed'][current_event] = True
+                                print(f"[EVENT] {current_event} passed!")
+                
+                # Update golden lane status
+                golden_lane = get_golden_lane_for_time(elapsed)
+                if golden_lane is not None:
+                    if not shared_data.get('golden_lane_active', False):
+                        # Golden lane just became active - announce it
+                        shared_data['golden_lane_active'] = True
+                        shared_data['golden_lane_number'] = golden_lane
+                        shared_data['golden_lane_until'] = time.time() + GOLDEN_LANE_DURATION
+                        shared_data['golden_lane_target_reached'] = False
+                        shared_data['golden_lane_passed'] = False
+                        print(f"[GOLDEN] ⭐ Golden lane {golden_lane} activated! Move to this lane!")
+                    else:
+                        # Update the target lane if it changed (shouldn't happen mid-event)
+                        pass
+                else:
+                    # Golden lane is not active
+                    if shared_data.get('golden_lane_active', False):
+                        # Check if we passed it
+                        if current_lane == shared_data.get('golden_lane_number', 0):
+                            shared_data['golden_lane_passed'] = True
+                            shared_data['run_summary']['events_passed']['golden_lane'] = True
+                            print(f"[GOLDEN] Golden lane {shared_data.get('golden_lane_number', 0)} passed!")
+                        shared_data['golden_lane_active'] = False
+            
+            # SUPER FAST LIGHT DETECTION
             try:
                 gray_full = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
                 current_brightness = float(np.mean(gray_full))
@@ -2060,6 +2294,22 @@ def processing_task():
                 if trailing_detected:
                     cv2.putText(debug_frame, "⚠️ TRAILING CAR - DODGE ⚠️", (10, 180),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                
+                # Show golden lane status
+                golden_active = shared_data.get('golden_lane_active', False)
+                golden_passed = shared_data.get('golden_lane_passed', False)
+                golden_target_reached = shared_data.get('golden_lane_target_reached', False)
+                if golden_active and not golden_passed:
+                    golden_lane = shared_data.get('golden_lane_number', 0)
+                    if golden_target_reached:
+                        cv2.putText(debug_frame, f"⭐ ON GOLDEN LANE {golden_lane} ⭐", (10, 200),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(debug_frame, f"⭐ MOVE TO LANE {golden_lane} ⭐", (10, 200),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                elif golden_passed:
+                    cv2.putText(debug_frame, "✅ GOLDEN LANE PASSED! ✅", (10, 200),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
             effect = get_active_yellow_effect()
             if effect:
@@ -2294,6 +2544,10 @@ def send_controls_task():
         police_lane = shared_data.get('police_lane', None)
         trailing_lane = shared_data.get('trailing_lane', None)
         lane_follow = dict(shared_data.get('lane_follow', {}))
+        golden_active = shared_data.get('golden_lane_active', False)
+        golden_lane = shared_data.get('golden_lane_number', 0)
+        golden_passed = shared_data.get('golden_lane_passed', False)
+        golden_until = shared_data.get('golden_lane_until', 0.0)
 
     steering_input = 0.0
     acceleration_input = CAR_ACCELERATION 
@@ -2332,6 +2586,86 @@ def send_controls_task():
         return
 
     img_w, img_h = (front_frame.shape[1], front_frame.shape[0]) if front_frame is not None else (640, 480)
+    
+    # =========================================================
+    # GOLDEN LANE HANDLING - HIGHEST PRIORITY
+    # During golden lane, we ONLY focus on reaching and staying on the lane
+    # No token detection or collection during golden lane event
+    # =========================================================
+    if golden_active and not golden_passed:
+        now = time.time()
+        remaining_time = golden_until - now
+        
+        # Check if we're on the golden lane
+        if current_lane == golden_lane:
+            with data_lock:
+                shared_data['golden_lane_target_reached'] = True
+            
+            # We're on the correct lane - maintain position
+            decision_reason = "GOLDEN_LANE_HOLD"
+            selected_target_type = "GOLDEN"
+            acceleration_input = min(acceleration_input, 0.72)  # Slow down to stay on lane
+            
+            # Use lane following to stay centered
+            lane_center_x = lane_follow.get('lane_center_x')
+            if lane_follow.get('valid') and lane_center_x is not None:
+                steering_input = float(lane_follow.get('smoothed_steering', 0.0))
+            else:
+                # Fallback: use tap steering to stay on lane
+                steering_input = apply_tap_steering(golden_lane)
+            
+            # Check if timer expired - we're on the lane, so we pass
+            if remaining_time <= 0:
+                with data_lock:
+                    shared_data['golden_lane_passed'] = True
+                    shared_data['run_summary']['events_passed']['golden_lane'] = True
+                    print(f"[GOLDEN] ✅ Golden lane {golden_lane} passed! Timer expired while on lane.")
+                decision_reason = "GOLDEN_LANE_PASSED"
+            
+            cv2.putText(front_frame, f"⭐ ON GOLDEN LANE {golden_lane} ⭐", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            # Not on the golden lane yet - MOVE THERE NOW
+            with data_lock:
+                shared_data['golden_lane_target_reached'] = False
+            
+            decision_reason = "GOLDEN_LANE_APPROACH"
+            selected_target_type = "GOLDEN"
+            desired_lane = golden_lane
+            acceleration_input = min(acceleration_input, 0.78)  # Moderate speed to reach lane
+            
+            # Use tap steering to change lanes quickly
+            steering_input = apply_tap_steering(golden_lane)
+            
+            cv2.putText(front_frame, f"⭐ MOVE TO LANE {golden_lane}! {remaining_time:.1f}s ⭐", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Update golden lane status
+        with data_lock:
+            if remaining_time > 0:
+                shared_data['golden_lane_until'] = now + remaining_time
+        
+        # During golden lane, we DON'T collect tokens - pure focus on the lane
+        # So we skip token collection logic
+        with data_lock:
+            shared_data['target_lane'] = desired_lane
+            shared_data['current_mode'] = "⭐ GOLDEN LANE ⭐"
+            shared_data['decision_debug'] = f"{decision_reason} L{current_lane}->{desired_lane} T{steering_state} S{steering_input:.2f} A{acceleration_input:.2f}"
+            shared_data['steering_input'] = steering_input
+            shared_data['acceleration_input'] = acceleration_input
+            shared_data['speed_modifier'] = speed_modifier
+            shared_data['selected_target_type'] = selected_target_type
+        
+        try:
+            send_control_packet(steering_input, acceleration_input)
+        except Exception as e:
+            print(f"Network error: {e}")
+            control_conn = None
+        return
+    
+    # =========================================================
+    # END OF GOLDEN LANE HANDLING - Resume normal operation
+    # =========================================================
     
     # Avoid red/yellow during normal driving. Red is only a target while Police is active.
     hazard_colors = {'yellow'} if police_red_required else {'red', 'yellow'}
@@ -2542,7 +2876,7 @@ def send_controls_task():
             control_conn = None
         return
 
-    if decision_reason in ("MAINTAIN", "POLICE_RED_TOKEN") and (current_lane in red_hazard_lanes or desired_lane in red_hazard_lanes):
+    if decision_reason not in ("GOLDEN_LANE_APPROACH", "GOLDEN_LANE_HOLD", "GOLDEN_LANE_PASSED") and (current_lane in red_hazard_lanes or desired_lane in red_hazard_lanes):
         safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
         if safe_lane != desired_lane:
             desired_lane = safe_lane
@@ -2551,7 +2885,7 @@ def send_controls_task():
             hazard_debug_tokens = red_hazard_tokens
             acceleration_input = min(acceleration_input, 0.80)
 
-    if decision_reason in ("MAINTAIN", "POLICE_RED_TOKEN") and (current_lane in yellow_hazard_lanes or desired_lane in yellow_hazard_lanes):
+    if decision_reason not in ("GOLDEN_LANE_APPROACH", "GOLDEN_LANE_HOLD", "GOLDEN_LANE_PASSED") and (current_lane in yellow_hazard_lanes or desired_lane in yellow_hazard_lanes):
         safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
         if safe_lane != desired_lane:
             desired_lane = safe_lane
@@ -2563,7 +2897,7 @@ def send_controls_task():
     # =========================================================
     # TOKEN DECISION - Seek reachable GREEN tokens after hazards
     # =========================================================
-    if decision_reason != "MAINTAIN" or trailing_detected:
+    if decision_reason not in ("MAINTAIN", "GOLDEN_LANE_APPROACH", "GOLDEN_LANE_HOLD", "GOLDEN_LANE_PASSED") or trailing_detected:
         green_reject_counts['event_override'] = len(green_tokens_visible)
     if decision_reason == "MAINTAIN" and not trailing_detected:
         previous_target = locked_green_target if locked_green_target_frames > 0 else None
@@ -2651,6 +2985,9 @@ def send_controls_task():
     acceleration_input = apply_speed_rules(acceleration_input)
 
     mode_map = {
+        "GOLDEN_LANE_APPROACH": "⭐ GOLDEN LANE ⭐",
+        "GOLDEN_LANE_HOLD": "⭐ GOLDEN LANE ⭐",
+        "GOLDEN_LANE_PASSED": "⭐ GOLDEN LANE PASSED ⭐",
         "POLICE_EVADE": "POLICE MODE",
         "POLICE_RED_TOKEN": "POLICE MODE",
         "TRAILING_EVADE": "TRAILING CAR AVOID",
@@ -2665,6 +3002,12 @@ def send_controls_task():
         current_mode_text = "TRAILING CAR AVOID"
     else:
         current_mode_text = mode_map.get(decision_reason, "LANE FOLLOW")
+
+    # Check tactical win condition
+    tactical_win = check_tactical_win_condition()
+    if tactical_win:
+        print("🏆 TACTICAL WIN ACHIEVED! 🏆")
+        current_mode_text = "🏆 TACTICAL WIN! 🏆"
 
     with data_lock:
         shared_data['target_lane'] = desired_lane
@@ -2780,6 +3123,16 @@ if __name__ == '__main__':
         shared_data['run_summary']['light_recovery_attempts'] = 0
         shared_data['run_summary']['light_recovered'] = False
         shared_data['run_summary']['speed_penalties'] = 0
+        shared_data['golden_lane_active'] = False
+        shared_data['golden_lane_number'] = 0
+        shared_data['golden_lane_until'] = 0.0
+        shared_data['golden_lane_passed'] = False
+        shared_data['golden_lane_announce_time'] = 0.0
+        shared_data['golden_lane_target_reached'] = False
+        shared_data['golden_lane_approach_start'] = 0.0
+        shared_data['current_event'] = None
+        shared_data['event_start_time'] = 0.0
+        shared_data['event_cycle_time'] = 0.0
 
     cv2.namedWindow("Front Camera", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Back Camera", cv2.WINDOW_NORMAL)
@@ -2794,12 +3147,24 @@ if __name__ == '__main__':
     print(" 🏁 SPEED TRIALS 2D - FULLY AUTONOMOUS DRIVER 🏁")
     print("="*60)
     print("\nFeatures Implemented:")
+    print("  - Game Time: 3 minutes")
+    print("  - Golden Lane Event (5s to stay on designated lane)")
+    print("  - Tactical Win: Net +60 Green Tokens + All Events Passed")
     print("  - Super Fast Light Detection & Recovery (0.2s interval)")
     print("  - Police Car Detection (Split Red/Blue) with Lane Tracking")
     print("  - Trailing Car Detection (Cyan/Teal) with Lane Tracking")
     print("  - Emergency Lane Evasion for Same-Lane Threats")
     print("  - Green Token Seeking (Avoid Red Tokens)")
     print("  - Split Screen Detection (Not Low Light)")
+    print("\nEvent Cycle (60s):")
+    print("  - Darkness: 0-30s")
+    print("  - Police Car: 30-50s")
+    print("  - Chasing Car A: 0-30s")
+    print("  - Chasing Car B: 50-60s")
+    print("  - Golden Lane: 0-55s (random lane)")
+    print("\nWin Conditions:")
+    print("  - Tactical Win: Net +60 Green Tokens + All Events Passed")
+    print("  - Distance Traveled at 180s (fallback)")
     print("\nInitializing...")
     
     threading.Thread(target=setup_control_server, daemon=True).start()
@@ -2855,12 +3220,19 @@ if __name__ == '__main__':
         light_recovered = summary.get('light_recovered', False)
         trailing_count = shared_data.get('trailing_count', 0)
         police_confidence = shared_data.get('police_confidence', 0.0)
+        events_passed = summary.get('events_passed', {})
+        tactical_win = summary.get('tactical_win_achieved', False)
     
     if summary:
         print("\nTokens Collected:")
         print(f"  🟢 Green:  {summary.get('green_collected', 0)}")
         print(f"  🟡 Yellow: {summary.get('yellow_collected', 0)}")
         print(f"  🔴 Red:    {summary.get('red_collected', 0)}")
+        
+        green = summary.get('green_collected', 0)
+        red = summary.get('red_collected', 0)
+        net_green = green - red
+        print(f"  📊 Net Green: +{net_green} (Target: +{TACTICAL_WIN_THRESHOLD})")
         
         yellow_effects = summary.get('yellow_effects', {})
         if yellow_effects:
@@ -2888,7 +3260,26 @@ if __name__ == '__main__':
         print("\n" + "-"*60)
         print("DETECTED EVENTS:")
         print("-"*60)
-        print(f"  🚓 Police Car Appeared:   {'YES' if summary.get('police_appeared') else 'NO'}")
-        print(f"  🚘 Trailing Car Appeared: {'YES' if summary.get('trailing_appeared') else 'NO'}")
+        for event_name, passed in events_passed.items():
+            status = "✅ PASSED" if passed else "❌ NOT PASSED"
+            print(f"  {event_name}: {status}")
+        
+        print("\n" + "-"*60)
+        print("WIN CONDITION:")
+        print("-"*60)
+        if tactical_win:
+            print("  🏆 TACTICAL WIN ACHIEVED! 🏆")
+            print("  Net +60 Green Tokens AND All Events Passed!")
+        else:
+            if net_green >= TACTICAL_WIN_THRESHOLD:
+                print("  ✅ Net +60 Green Tokens achieved!")
+            else:
+                print(f"  ❌ Need {TACTICAL_WIN_THRESHOLD - net_green} more green tokens for Tactical Win")
+            if all(events_passed.values()):
+                print("  ✅ All events passed!")
+            else:
+                missing = [e for e, p in events_passed.items() if not p]
+                print(f"  ❌ Missing events: {', '.join(missing)}")
+            print("  📊 Distance Traveled at 180s will determine winner")
     
     print("\n" + "="*60 + "\n")
