@@ -98,7 +98,7 @@ LOWLIGHT_EVENT_WINDOW_SECONDS = 10.0
 LOWLIGHT_RECOVERY_INTERVAL = 0.05  # FASTER: 50ms between recovery attempts
 LOWLIGHT_FAST_RECOVERY_COUNT = 5  # More recovery attempts
 LOWLIGHT_CONFIRM_FRAMES = 3  # Fewer frames to confirm darkness
-LOWLIGHT_RECOVERY_FRAMES = 2  # Fewer frames to confirm recovery
+LOWLIGHT_RECOVERY_FRAMES = 1  # Recover on the first bright frame
 
 # Event schedule repeats every 60 seconds.
 EVENT_CYCLE_SECONDS = 60.0
@@ -107,7 +107,9 @@ EV2_POLICE_WINDOW = (30.0, 50.0)
 EV3_CHASING_A_WINDOW = (0.0, 30.0)
 EV4_CHASING_B_WINDOW = (50.0, 60.0)
 EV5_GOLDEN_LANE_WINDOW = (0.0, 55.0)
-EV5_MIN_GREEN_LANE_TOKENS = 2
+EV5_MIN_GREEN_LANE_TOKENS = 1
+EV5_GOLDEN_LANE_SECONDS = 5.0
+POLICE_RED_TARGET_START_SECONDS = 0.0
 
 # Police car detection - Based on split red/blue color scheme
 POLICE_CONFIRM_FRAMES = 5
@@ -1650,6 +1652,17 @@ def ev4_chasing_b_allowed():
 def ev5_golden_lane_allowed():
     return event_window_active(EV5_GOLDEN_LANE_WINDOW)
 
+def clear_ev2_police_state():
+    """Clear all EV2/police flags after the red token is collected."""
+    shared_data['ev2_police_active'] = False
+    shared_data['ev2_red_token_collected'] = True
+    shared_data['red_token_collected_during_police'] = True
+    shared_data['police_detected'] = False
+    shared_data['police_active'] = False
+    shared_data['police_front_detected'] = False
+    shared_data['front_police_evade'] = False
+    shared_data['police_detection_history'] = []
+
 def green_rejection_reason(token, frame_width, frame_height, current_lane, blocking_hazards):
     if token.get('color') != 'green':
         return "not_green"
@@ -1819,13 +1832,7 @@ def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane
         
         # EV2: Check if red token collected during police event
         if color == 'red' and shared_data.get('ev2_police_active', False):
-            shared_data['ev2_red_token_collected'] = True
-            shared_data['red_token_collected_during_police'] = True
-            shared_data['ev2_police_active'] = False
-            shared_data['police_detected'] = False
-            shared_data['police_active'] = False
-            shared_data['front_police_evade'] = False
-            shared_data['police_detection_history'] = []
+            clear_ev2_police_state()
             print(f"[EV2] Red token collected! Police threat neutralized.")
 
     if color == 'yellow':
@@ -2035,32 +2042,6 @@ def processing_task():
                     if len(police_history) > 5:
                         police_history.pop(0)
                 shared_data['police_detection_history'] = police_history
-                
-                # EV3 & EV4: Chasing car detection
-                if chasing_front and chasing_front_conf >= 0.5:
-                    trailing_streak = shared_data.get('trailing_streak', 0) + 1
-                    shared_data['trailing_streak'] = trailing_streak
-                    shared_data['trailing_lane'] = chasing_front_lane
-                    
-                    if trailing_streak >= 3:
-                        shared_data['trailing_detected'] = ev3_window or ev4_window
-                        shared_data['danger_detected'] = ev3_window or ev4_window
-                        
-                        if ev3_window and not shared_data.get('ev3_chasing1_active', False):
-                            shared_data['ev3_chasing1_active'] = True
-                            shared_data['ev3_chasing1_start_time'] = time.time()
-                            shared_data['ev3_chasing1_evaded'] = False
-                            print(f"[EV3] 🏎️ CHASING CAR 1 DETECTED! (10 sec to avoid)")
-                        elif ev4_window and not shared_data.get('ev4_chasing2_active', False):
-                            shared_data['ev4_chasing2_active'] = True
-                            shared_data['ev4_chasing2_start_time'] = time.time()
-                            shared_data['ev4_chasing2_evaded'] = False
-                            print(f"[EV4] 🏎️ CHASING CAR 2 DETECTED! (3 sec to avoid)")
-                else:
-                    trailing_streak = max(0, shared_data.get('trailing_streak', 0) - 1)
-                    shared_data['trailing_streak'] = trailing_streak
-                    if trailing_streak < 3:
-                        shared_data['trailing_detected'] = False
             
             # If police car detected in front and in same lane, EVADE IMMEDIATELY!
             if ev2_window and not ev2_already_done and police_front and police_front_conf >= 0.60 and police_front_lane == current_lane:
@@ -2068,14 +2049,6 @@ def processing_task():
                 with data_lock:
                     shared_data['front_police_evade'] = True
                     shared_data['front_police_evade_until'] = time.time() + 3.0
-            
-            # If chasing car detected in front and in same lane, EVADE IMMEDIATELY!
-            if (ev3_window or ev4_window) and chasing_front and chasing_front_conf >= 0.5 and chasing_front_lane == current_lane:
-                ev_type = "EV3" if shared_data.get('ev3_chasing1_active', False) and not shared_data.get('ev4_chasing2_active', False) else "EV4"
-                print(f"[{ev_type}] ⚠️ Chasing car in lane {chasing_front_lane}! EVADING IMMEDIATELY!")
-                with data_lock:
-                    shared_data['front_chasing_evade'] = True
-                    shared_data['front_chasing_evade_until'] = time.time() + 2.0
             
             # =========================================================
             # SUPER FAST LIGHT DETECTION & RECOVERY - ENHANCED
@@ -2100,16 +2073,18 @@ def processing_task():
                     std_dev = np.std(gray_full)
                     is_split_screen = std_dev > 80
                     
-                    # Determine if dark
+                    # Determine if dark (trigger only) and whether light has recovered
                     is_dark = False
+                    is_recovered = False
                     if not is_split_screen and baseline >= LOWLIGHT_MIN_BASELINE:
-                        if current_brightness < baseline * LOWLIGHT_DARK_THRESHOLD:
+                        if low_light_active:
+                            if current_brightness >= baseline * LOWLIGHT_RECOVERY_THRESHOLD:
+                                is_recovered = True
+                        elif current_brightness < baseline * LOWLIGHT_DARK_THRESHOLD:
                             is_dark = True
                             if not low_light_active:
                                 print(f"[LIGHT] ⚡ DARKNESS DETECTED! Brightness: {current_brightness:.1f} (baseline: {baseline:.1f})")
                                 shared_data['recovery_phase'] = 1
-                        elif low_light_active and current_brightness < baseline * LOWLIGHT_RECOVERY_THRESHOLD:
-                            is_dark = True
                     
                     # Handle darkness detection with confirmation
                     if is_dark and not low_light_active and ev1_darkness_allowed():
@@ -2124,7 +2099,7 @@ def processing_task():
                             shared_data['ev1_darkness_brake_sent'] = False
                             print(f"[EV1] 🌑 DARKNESS CONFIRMED! Must brake/decelerate fully!")
                             light_confirm_count = 0
-                    elif not is_dark and low_light_active:
+                    elif is_recovered and low_light_active:
                         recovery_confirm_count += 1
                         if recovery_confirm_count >= LOWLIGHT_RECOVERY_FRAMES:
                             shared_data['low_light_active'] = False
@@ -2136,16 +2111,19 @@ def processing_task():
                             shared_data['run_summary']['light_recovered'] = True
                             shared_data['ev1_darkness_active'] = False
                             recovery_confirm_count = 0
+                            light_confirm_count = 0
                             print(f"[LIGHT] ✅ LIGHT RESTORED! Brightness: {current_brightness:.1f}")
                             print(f"[EV1] ✅ Darkness event resolved!")
                     else:
-                        # Reset confirm counts if conditions change
                         if is_dark:
                             light_confirm_count = min(light_confirm_count + 1, LOWLIGHT_CONFIRM_FRAMES)
                             recovery_confirm_count = 0
-                        else:
+                        elif is_recovered:
                             recovery_confirm_count = min(recovery_confirm_count + 1, LOWLIGHT_RECOVERY_FRAMES)
                             light_confirm_count = 0
+                        else:
+                            light_confirm_count = 0
+                            recovery_confirm_count = 0
                     
                     # Update baseline with adaptive learning
                     if not low_light_active:
@@ -2519,10 +2497,13 @@ def send_controls_task():
         'reason': 'inactive'
     }
 
-    def apply_speed_rules(raw_acceleration):
+    def apply_speed_rules(raw_acceleration, ensure_movement=False):
         if raw_acceleration <= 0.0:
             return raw_acceleration
-        return max(0.0, min(MAX_ACCELERATION, raw_acceleration * speed_modifier))
+        adjusted = raw_acceleration * speed_modifier
+        if ensure_movement or steering_state != 0 or speed_modifier < 0.75:
+            adjusted = max(adjusted, MIN_ACCELERATION_WHEN_SLOWED)
+        return max(0.0, min(MAX_ACCELERATION, adjusted))
 
     def steer_toward_green(token, multiplier):
         image_center_x = img_w / 2.0
@@ -2542,10 +2523,7 @@ def send_controls_task():
     if ev2_police_active and ev2_red_collected:
         ev2_police_active = False
         with data_lock:
-            shared_data['ev2_police_active'] = False
-            shared_data['police_detected'] = False
-            shared_data['police_active'] = False
-            shared_data['front_police_evade'] = False
+            clear_ev2_police_state()
     current_event_cycle = event_cycle_index()
     with data_lock:
         ev5_last_cycle = shared_data.get('ev5_golden_lane_cycle', -1)
@@ -2558,6 +2536,7 @@ def send_controls_task():
                 shared_data['ev5_golden_lane_start_time'] = time.time()
                 shared_data['ev5_golden_lane_target'] = candidate_ev5_lane
                 shared_data['ev5_golden_lane_cycle'] = current_event_cycle
+            print(f"[EV5] 🌟 GOLDEN LANE EVENT! Target lane {candidate_ev5_lane + 3}")
     
     # =========================================================
     # SUPER FAST LIGHT RECOVERY - ENHANCED
@@ -2565,14 +2544,11 @@ def send_controls_task():
     # =========================================================
     if low_light_active or ev1_darkness_active:
         with data_lock:
-            recovery_sent = shared_data.get('low_light_recovery_sent', False)
-            last_recovery_time = shared_data.get('last_recovery_time', 0.0)
-            recovery_attempts = shared_data.get('recovery_attempts', 0)
             current_brightness = shared_data.get('brightness_last', 0.0)
             baseline = shared_data.get('brightness_baseline', current_brightness)
         
-        # Check if light is restored
-        if current_brightness > baseline * LOWLIGHT_RECOVERY_THRESHOLD:
+        # Check if light is restored - resume driving immediately
+        if current_brightness >= baseline * LOWLIGHT_RECOVERY_THRESHOLD:
             with data_lock:
                 shared_data['low_light_active'] = False
                 shared_data['lights_on'] = True
@@ -2581,63 +2557,34 @@ def send_controls_task():
                 shared_data['recovery_phase'] = 0
                 shared_data['run_summary']['light_recovered'] = True
                 shared_data['ev1_darkness_active'] = False
+            low_light_active = False
+            ev1_darkness_active = False
             print(f"[LIGHT] ✅ LIGHT RESTORED! Brightness: {current_brightness:.1f}")
             print(f"[EV1] ✅ Darkness event resolved!")
-            return
-        
-        time_since_recovery = time.time() - last_recovery_time
-        
-        # Send recovery burst - FAST!
-        if not recovery_sent or time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
+        else:
             steering_input = 0.0
-            acceleration_input = -1.0  # Challenge 1: Send acceleration_input = -1.0
-            
+            acceleration_input = -1.0
             with data_lock:
-                shared_data['low_light_recovery_sent'] = True
-                shared_data['last_recovery_time'] = time.time()
-                shared_data['recovery_attempts'] = recovery_attempts + 1
-                shared_data['run_summary']['light_recovery_attempts'] = shared_data['run_summary'].get('light_recovery_attempts', 0) + 1
                 shared_data['steering_input'] = steering_input
                 shared_data['acceleration_input'] = acceleration_input
                 shared_data['speed_modifier'] = speed_modifier
                 shared_data['selected_target_type'] = 'LOW_LIGHT'
                 shared_data['current_mode'] = 'LOW_LIGHT'
                 shared_data['ev1_darkness_active'] = True
-            
-            print(f"[LIGHT] ⚡ FAST RECOVERY BURST (attempt {recovery_attempts + 1})")
-            print(f"[LIGHT] Sending acceleration_input = -1.0 to recover light!")
-            
-            send_fast_recovery_burst()
+                shared_data['low_light_recovery_sent'] = True
+                shared_data['last_recovery_time'] = time.time()
+                shared_data['recovery_attempts'] = shared_data.get('recovery_attempts', 0) + 1
             try:
-                control_conn.sendall(struct.pack('ff', 0.0, -1.0))
-            except Exception:
-                pass
-            
-            print(f"[LIGHT] ✅ Recovery burst sent! Waiting for light to restore...")
+                control_conn.sendall(struct.pack('ff', steering_input, acceleration_input))
+            except Exception as e:
+                print(f"Network error: {e}")
+                control_conn = None
             return
-        
-        # Continue sending brake signal if still dark
-        steering_input = 0.0
-        acceleration_input = -1.0  # Keep braking until recovered
-        with data_lock:
-            shared_data['steering_input'] = steering_input
-            shared_data['acceleration_input'] = acceleration_input
-            shared_data['speed_modifier'] = speed_modifier
-            shared_data['selected_target_type'] = 'LOW_LIGHT'
-            shared_data['current_mode'] = 'LOW_LIGHT'
-            shared_data['ev1_darkness_active'] = True
-        
-        try:
-            control_conn.sendall(struct.pack('ff', steering_input, acceleration_input))
-        except Exception as e:
-            print(f"Network error: {e}")
-            control_conn = None
-        return
 
     # =========================================================
     # EV2: POLICE CAR - MUST collect red token within 5 seconds
     # =========================================================
-    if ev2_police_active:
+    if ev2_police_active and not ev2_red_collected:
         elapsed = time.time() - ev2_police_start
         remaining = max(0, 5.0 - elapsed)
         
@@ -2671,13 +2618,7 @@ def send_controls_task():
             
             if target_red['y'] >= img_h * 0.85:
                 with data_lock:
-                    shared_data['ev2_red_token_collected'] = True
-                    shared_data['red_token_collected_during_police'] = True
-                    shared_data['ev2_police_active'] = False
-                    shared_data['police_detected'] = False
-                    shared_data['police_active'] = False
-                    shared_data['front_police_evade'] = False
-                    shared_data['police_detection_history'] = []
+                    clear_ev2_police_state()
                     shared_data['run_summary']['red_collected'] += 1
                 ev2_police_active = False
                 ev2_red_collected = True
@@ -2706,10 +2647,12 @@ def send_controls_task():
                     shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
                     speed_penalties += 1
                     speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
-            shared_data['ev2_police_active'] = False
+            ev2_police_active = False
+            with data_lock:
+                shared_data['ev2_police_active'] = False
 
     # =========================================================
-    # EV3: CHASING CAR 1 - Avoid collision (10 sec)
+    # EV3: CHASING CAR 1 - Avoid collision using back camera (10 sec)
     # =========================================================
     if ev3_chasing1_active:
         elapsed = time.time() - ev3_chasing1_start
@@ -2718,8 +2661,8 @@ def send_controls_task():
         if int(elapsed * 2) != int((elapsed - 0.02) * 2):
             print(f"[EV3] 🏎️ CHASING CAR 1 ACTIVE! {remaining:.1f}s to evade!")
         
-        if chasing_front_detected and chasing_front_lane == current_lane:
-            safe_lane = get_safe_lane(current_lane, {current_lane, chasing_front_lane}, img_w)
+        if trailing_detected and trailing_lane is not None and trailing_lane == current_lane:
+            safe_lane = get_safe_lane(current_lane, {current_lane, trailing_lane}, img_w)
             if safe_lane != current_lane:
                 desired_lane = safe_lane
                 decision_reason = "EV3_CHASING_EVADE"
@@ -2727,26 +2670,26 @@ def send_controls_task():
                 steering_input = apply_tap_steering(safe_lane)
                 with data_lock:
                     shared_data['ev3_chasing1_evaded'] = True
+                    shared_data['emergency_evade_lane'] = safe_lane
+                    shared_data['emergency_evade_until'] = time.time() + 2.0
             else:
                 acceleration_input = min(acceleration_input, 0.4)
                 decision_reason = "EV3_CHASING_BRAKE"
-        else:
-            with data_lock:
-                if not shared_data.get('ev3_chasing1_evaded', False):
-                    shared_data['ev3_chasing1_evaded'] = True
-                shared_data['ev3_chasing1_active'] = False
         
-        if elapsed > 10.0 and not shared_data.get('ev3_chasing1_evaded', False):
+        if elapsed > 10.0:
+            if not shared_data.get('ev3_chasing1_evaded', False):
+                with data_lock:
+                    if not shared_data.get('trailing_first_penalty_applied', False):
+                        shared_data['trailing_first_penalty_applied'] = True
+                        shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
+                        speed_penalties += 1
+                        speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
             with data_lock:
-                if not shared_data.get('trailing_first_penalty_applied', False):
-                    shared_data['trailing_first_penalty_applied'] = True
-                    shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
-                    speed_penalties += 1
-                    speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
-            shared_data['ev3_chasing1_active'] = False
+                shared_data['ev3_chasing1_active'] = False
+            ev3_chasing1_active = False
 
     # =========================================================
-    # EV4: CHASING CAR 2 - Avoid collision (3 sec)
+    # EV4: CHASING CAR 2 - Avoid collision using back camera (3 sec)
     # =========================================================
     if ev4_chasing2_active:
         elapsed = time.time() - ev4_chasing2_start
@@ -2755,8 +2698,8 @@ def send_controls_task():
         if int(elapsed * 2) != int((elapsed - 0.02) * 2):
             print(f"[EV4] 🏎️ CHASING CAR 2 ACTIVE! {remaining:.1f}s to evade!")
         
-        if chasing_front_detected and chasing_front_lane == current_lane:
-            safe_lane = get_safe_lane(current_lane, {current_lane, chasing_front_lane}, img_w)
+        if trailing_detected and trailing_lane is not None and trailing_lane == current_lane:
+            safe_lane = get_safe_lane(current_lane, {current_lane, trailing_lane}, img_w)
             if safe_lane != current_lane:
                 desired_lane = safe_lane
                 decision_reason = "EV4_CHASING_EVADE"
@@ -2764,33 +2707,31 @@ def send_controls_task():
                 steering_input = apply_tap_steering(safe_lane)
                 with data_lock:
                     shared_data['ev4_chasing2_evaded'] = True
+                    shared_data['emergency_evade_lane'] = safe_lane
+                    shared_data['emergency_evade_until'] = time.time() + 2.0
             else:
                 acceleration_input = min(acceleration_input, 0.3)
                 decision_reason = "EV4_CHASING_BRAKE"
-        else:
-            with data_lock:
-                if not shared_data.get('ev4_chasing2_evaded', False):
-                    shared_data['ev4_chasing2_evaded'] = True
-                shared_data['ev4_chasing2_active'] = False
         
-        if elapsed > 3.0 and not shared_data.get('ev4_chasing2_evaded', False):
+        if elapsed > 3.0:
+            if not shared_data.get('ev4_chasing2_evaded', False):
+                with data_lock:
+                    if not shared_data.get('trailing_second_penalty_applied', False):
+                        shared_data['trailing_second_penalty_applied'] = True
+                        shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
+                        speed_penalties += 1
+                        speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
             with data_lock:
-                if not shared_data.get('trailing_second_penalty_applied', False):
-                    shared_data['trailing_second_penalty_applied'] = True
-                    shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
-                    speed_penalties += 1
-                    speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
-            shared_data['ev4_chasing2_active'] = False
+                shared_data['ev4_chasing2_active'] = False
+            ev4_chasing2_active = False
 
     # =========================================================
     # EV5: GOLDEN LANE - Be in the golden lane when timer expires
     # =========================================================
     if ev5_golden_lane_active:
         elapsed = time.time() - shared_data.get('ev5_golden_lane_start_time', 0)
-        remaining = max(0, 5.0 - elapsed)
-        configured_target_lane = shared_data.get('ev5_golden_lane_target', 0)
-        target_lane = lane_with_most_green_tokens(green_tokens_visible, img_w, img_h, current_lane) if green_tokens_visible else configured_target_lane
-        target_lane = max(-2, min(2, target_lane))
+        remaining = max(0, EV5_GOLDEN_LANE_SECONDS - elapsed)
+        target_lane = max(-2, min(2, shared_data.get('ev5_golden_lane_target', 0)))
         
         if int(elapsed * 2) != int((elapsed - 0.02) * 2):
             print(f"[EV5] 🌟 GOLDEN LANE ACTIVE! {remaining:.1f}s to reach lane {target_lane}")
@@ -2799,25 +2740,23 @@ def send_controls_task():
             desired_lane = target_lane
             decision_reason = "EV5_GOLDEN_LANE"
             selected_target_type = "EV5_GOLDEN"
-            acceleration_input = min(max(acceleration_input, GREEN_APPROACH_MIN_ACCELERATION), GREEN_APPROACH_MAX_ACCELERATION)
+            acceleration_input = GREEN_CHASE_ACCELERATION
             steering_input = apply_tap_steering(target_lane)
-            target_debug = f"ev5_green_lane:{target_lane + 3} greens:{len(green_tokens_visible)}"
+            target_debug = f"ev5_target_lane:{target_lane + 3}"
         else:
-            with data_lock:
-                shared_data['ev5_golden_lane_active'] = False
-                shared_data['ev5_golden_lane_target'] = target_lane
-            ev5_golden_lane_active = False
             decision_reason = "EV5_GOLDEN_LANE"
             selected_target_type = "EV5_GOLDEN"
-            target_debug = f"ev5_reached_lane:{target_lane + 3}"
+            acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
+            target_debug = f"ev5_hold_lane:{target_lane + 3}"
         
-        if elapsed > 5.0:
+        if elapsed > EV5_GOLDEN_LANE_SECONDS:
             if current_lane == target_lane:
                 print(f"[EV5] ✅ Success! Was in golden lane {target_lane} at timer expiry!")
             else:
                 print(f"[EV5] ❌ Failed! Not in golden lane {target_lane} at timer expiry!")
             with data_lock:
                 shared_data['ev5_golden_lane_active'] = False
+            ev5_golden_lane_active = False
 
     # =========================================================
     # FRONT POLICE CAR EVASION (if not in EV)
@@ -2845,7 +2784,28 @@ def send_controls_task():
             decision_reason = "FRONT_POLICE_BRAKE"
 
     # =========================================================
-    # FRONT CHASING CAR EVASION (if not in EV)
+    # BACK CHASING CAR EVASION (EV3/EV4 use back camera)
+    # =========================================================
+    elif trailing_detected and trailing_lane is not None and trailing_lane == current_lane and (ev3_chasing1_active or ev4_chasing2_active) and not any([ev1_darkness_active, ev2_police_active, ev5_golden_lane_active]):
+        hazard_lanes = {current_lane, trailing_lane}
+        safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w)
+        
+        if safe_lane != current_lane:
+            desired_lane = safe_lane
+            decision_reason = "TRAILING_EVADE"
+            selected_target_type = "TRAILING_EVADE"
+            acceleration_input = min(acceleration_input, 0.78)
+            steering_input = apply_tap_steering(safe_lane)
+            with data_lock:
+                shared_data['target_lane'] = safe_lane
+                shared_data['emergency_evade_lane'] = safe_lane
+                shared_data['emergency_evade_until'] = time.time() + 2.0
+        else:
+            acceleration_input = 0.4
+            decision_reason = "TRAILING_BRAKE"
+
+    # =========================================================
+    # FRONT CHASING CAR EVASION (fallback outside EV3/EV4)
     # =========================================================
     elif (front_chasing_evade or (chasing_front_detected and chasing_front_lane == current_lane)) and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active, ev5_golden_lane_active]):
         hazard_lanes = {current_lane}
@@ -2988,7 +2948,7 @@ def send_controls_task():
 
     green_event_blocked = (
         ev1_darkness_active or
-        ev2_police_active or
+        (ev2_police_active and not ev2_red_collected) or
         ev3_chasing1_active or
         ev4_chasing2_active or
         ev5_golden_lane_active or
@@ -3038,13 +2998,13 @@ def send_controls_task():
             steering_multiplier = 2.5 if decision_reason == "GREEN_TARGET" else 1.3
             if desired_lane != current_lane or steering_state != 0:
                 steering_input = apply_tap_steering(desired_lane)
-                acceleration_input = min(max(acceleration_input, GREEN_APPROACH_MIN_ACCELERATION), GREEN_APPROACH_MAX_ACCELERATION)
+                acceleration_input = max(acceleration_input, MIN_STEERING_ACCELERATION)
             else:
                 steering_input = steer_toward_green(selected_green_target, steering_multiplier)
                 if abs(steering_input) > GREEN_APPROACH_STEER_DEADZONE:
                     if abs(steering_input) < GREEN_APPROACH_MIN_STEER:
                         steering_input = GREEN_APPROACH_MIN_STEER if steering_input > 0.0 else -GREEN_APPROACH_MIN_STEER
-                acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
+                acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION, MIN_ACCELERATION_WHEN_SLOWED)
             target_debug = (
                 f"green_target:{int(selected_green_target['x'])},{int(selected_green_target['y'])} "
                 f"lane:{desired_lane + 3} "
@@ -3130,7 +3090,10 @@ def send_controls_task():
         green_reject_reason_label = "none"
 
     # Apply speed rules
-    acceleration_input = apply_speed_rules(acceleration_input)
+    needs_movement = decision_reason in (
+        "GREEN_TARGET", "PRE_TARGET_GREEN", "EV5_GOLDEN_LANE", "EV2_RED_TOKEN"
+    ) or selected_target_type in ("GREEN", "EV5_GOLDEN")
+    acceleration_input = apply_speed_rules(acceleration_input, ensure_movement=needs_movement)
 
     # Mode mapping for display
     mode_map = {
