@@ -2842,20 +2842,32 @@ def send_controls_task():
     if decision_reason in ("MAINTAIN", "POLICE_RED_TOKEN") and (current_lane in red_hazard_lanes or desired_lane in red_hazard_lanes):
         safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
         if safe_lane != desired_lane:
+            if steering_state != 0 and committed_target_lane != safe_lane:
+                steering_state = 0
             desired_lane = safe_lane
             decision_reason = "AVOID_RED"
             selected_target_type = "AVOID_RED"
             hazard_debug_tokens = red_hazard_tokens
             acceleration_input = min(acceleration_input, 0.80)
+            steering_input = apply_tap_steering(desired_lane)
+        elif steering_state != 0:
+            decision_reason = "AVOID_RED"
+            steering_input = apply_tap_steering(desired_lane)
 
     if decision_reason in ("MAINTAIN", "POLICE_RED_TOKEN") and (current_lane in yellow_hazard_lanes or desired_lane in yellow_hazard_lanes):
         safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
         if safe_lane != desired_lane:
+            if steering_state != 0 and committed_target_lane != safe_lane:
+                steering_state = 0
             desired_lane = safe_lane
             decision_reason = "AVOID_YELLOW"
             selected_target_type = "AVOID_YELLOW"
             hazard_debug_tokens = yellow_hazard_tokens
             acceleration_input = min(acceleration_input, 0.80)
+            steering_input = apply_tap_steering(desired_lane)
+        elif steering_state != 0:
+            decision_reason = "AVOID_YELLOW"
+            steering_input = apply_tap_steering(desired_lane)
 
     # =========================================================
     # TOKEN DECISION - Seek reachable GREEN tokens (only if no EV is active)
