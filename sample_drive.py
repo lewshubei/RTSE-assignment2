@@ -2911,11 +2911,11 @@ def send_controls_task():
                 target_debug = f"fallback_evade:L{current_lane}->L{safe_lane}"
             else:
                 desired_lane = current_lane
-                    decision_reason = "FALLBACK_MAINTAIN"
-                    selected_target_type = "FALLBACK"
-                    if steering_state != 0:
-                        steering_input = apply_tap_steering(desired_lane)
-                    target_debug = f"fallback_maintain:L{current_lane}"
+                decision_reason = "FALLBACK_MAINTAIN"
+                selected_target_type = "FALLBACK"
+                if steering_state != 0:
+                    steering_input = apply_tap_steering(desired_lane)
+                target_debug = f"fallback_maintain:L{current_lane}"
 
     if decision_reason not in ("GREEN_TARGET", "PRE_TARGET_GREEN") and locked_green_target_frames > 0:
         locked_green_target_frames = 0
