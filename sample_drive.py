@@ -43,7 +43,7 @@ GREEN_LOCK_SECONDS = 1.6
 STEER_TAP_LOOPS = 12
 STEER_RESET_LOOPS = 4
 TOKEN_DECISION_Y_MIN = 40
-LANE_CHANGE_TAP_LOOPS = 18
+LANE_CHANGE_TAP_LOOPS = 8
 LANE_CHANGE_RESET_LOOPS = 2
 TOKEN_TARGET_MEMORY_SECONDS = 2.4
 GREEN_TARGET_LOCK_SECONDS = 2.8
@@ -1818,7 +1818,7 @@ def apply_tap_steering(desired_lane):
         return 0.0
 
     if steering_state == 2:
-        direction = 1.0 if committed_target_lane > current_lane else -1.0
+        direction = 2.5 if committed_target_lane > current_lane else -2.5
         tap_loop_count += 1
         if tap_loop_count >= LANE_CHANGE_TAP_LOOPS:
             current_lane = committed_target_lane
