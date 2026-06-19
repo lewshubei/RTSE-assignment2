@@ -140,6 +140,9 @@ TRAILING_APPROACH_RATIO = 1.05
 TRAILING_ASPECT_RATIO_MIN = 0.3
 TRAILING_ASPECT_RATIO_MAX = 3.0
 TRAILING_MIN_HEIGHT_RATIO = 0.08
+# The chasing car can appear outside its scored EV3/EV4 window.  Keep the
+# rear-camera safety response active whenever it is confirmed in our lane.
+TRAILING_ALWAYS_AVOID = True
 
 # Trailing car color ranges - Cyan/Teal
 TRAILING_CYAN_LOWER1 = np.array([80, 70, 70])
@@ -1653,7 +1656,7 @@ def ev5_golden_lane_allowed():
     return event_window_active(EV5_GOLDEN_LANE_WINDOW)
 
 def clear_ev2_police_state():
-    """Clear all EV2/police flags after the red token is collected."""
+    """Finish EV2 after its single required red-token pickup."""
     shared_data['ev2_police_active'] = False
     shared_data['ev2_red_token_collected'] = True
     shared_data['red_token_collected_during_police'] = True
@@ -2174,6 +2177,13 @@ def processing_task():
                 shared_data['detected_tokens'] = tokens
                 shared_data['lane_follow'] = lane_follow
 
+            # A pickup is only confirmed when the token reaches the car's
+            # collection line.  This is what clears EV2 after exactly one red.
+            maybe_record_collected_token(
+                tokens, processed_front_frame.shape[1], processed_front_frame.shape[0],
+                current_lane, processed_front_frame
+            )
+
             if ENABLE_HEAVY_OVERLAY:
                 debug_frame = draw_detected_tokens(processed_front_frame, tokens)
                 debug_frame = draw_lane_following_overlay(debug_frame, lane_follow, current_mode)
@@ -2301,9 +2311,11 @@ def processing_task():
                     if police_confirmed and ev2_window and not ev2_already_done:
                         shared_data['police_lane'] = police_lane
                     
-                    shared_data['trailing_detected'] = trailing_confirmed and (ev3_window or ev4_window)
+                    # Always use the back camera for same-lane collision avoidance.
+                    # EV3/EV4 still decide whether this counts as a timed event.
+                    shared_data['trailing_detected'] = trailing_confirmed and TRAILING_ALWAYS_AVOID
                     shared_data['police_detected'] = police_confirmed and ev2_window and not ev2_already_done
-                    shared_data['danger_detected'] = (trailing_confirmed and (ev3_window or ev4_window)) or (police_confirmed and ev2_window and not ev2_already_done)
+                    shared_data['danger_detected'] = (trailing_confirmed and TRAILING_ALWAYS_AVOID) or (police_confirmed and ev2_window and not ev2_already_done)
                     shared_data['police_confidence'] = police_confidence if police_raw else shared_data.get('police_confidence', 0.0)
                     
                     if police_confirmed and ev2_window and not ev2_already_done:
@@ -2616,22 +2628,9 @@ def send_controls_task():
                     decision_reason = "EV2_POLICE_EVADE"
                     steering_input = apply_tap_steering(safe_lane)
             
-            if target_red['y'] >= img_h * 0.85:
-                with data_lock:
-                    clear_ev2_police_state()
-                    shared_data['run_summary']['red_collected'] += 1
-                ev2_police_active = False
-                ev2_red_collected = True
-                police_detected = False
-                police_active = False
-                police_red_required = False
-                front_police_evade = False
-                locked_green_target = None
-                locked_green_target_frames = 0
-                locked_green_target_missing_frames = 0
-                decision_reason = "MAINTAIN"
-                selected_target_type = "NONE"
-                target_debug = "ev2_red_collected:return_green"
+            # Do not clear EV2 merely because a red token is visually close.
+            # maybe_record_collected_token() confirms the actual pickup at the
+            # collection line and clears the event after one red token.
         else:
             if police_front_detected and police_front_lane == current_lane:
                 safe_lane = get_safe_lane(current_lane, {current_lane, police_front_lane}, img_w)
@@ -2639,6 +2638,21 @@ def send_controls_task():
                     desired_lane = safe_lane
                     decision_reason = "EV2_POLICE_EVADE"
                     steering_input = apply_tap_steering(safe_lane)
+
+        # The chaser approaches from behind, so its lane comes from the back
+        # camera. Safety wins for this control cycle; the next cycle resumes
+        # the one-red EV2 target, then green once EV2 is cleared.
+        if trailing_detected and trailing_lane is not None and trailing_lane == current_lane:
+            safe_lane = get_safe_lane(current_lane, {current_lane, trailing_lane}, img_w)
+            if safe_lane != current_lane:
+                desired_lane = safe_lane
+                decision_reason = "EV2_CHASING_EVADE"
+                selected_target_type = "EV2_CHASING_EVADE"
+                acceleration_input = min(acceleration_input, 0.78)
+                steering_input = apply_tap_steering(safe_lane)
+                with data_lock:
+                    shared_data['emergency_evade_lane'] = safe_lane
+                    shared_data['emergency_evade_until'] = time.time() + 2.0
         
         if elapsed > 5.0 and not ev2_red_collected:
             with data_lock:
@@ -2865,7 +2879,7 @@ def send_controls_task():
     # If we're in emergency evade mode, maintain the evade lane
     # =========================================================
     with data_lock:
-        if decision_reason in ("FRONT_POLICE_EVADE", "FRONT_CHASING_EVADE", "POLICE_EVADE", "TRAILING_EVADE", "EV3_CHASING_EVADE", "EV4_CHASING_EVADE"):
+        if decision_reason in ("FRONT_POLICE_EVADE", "FRONT_CHASING_EVADE", "POLICE_EVADE", "TRAILING_EVADE", "EV2_CHASING_EVADE", "EV3_CHASING_EVADE", "EV4_CHASING_EVADE"):
             if time.time() < shared_data.get('emergency_evade_until', 0):
                 steering_input = apply_tap_steering(shared_data.get('emergency_evade_lane', current_lane))
             else:
@@ -3097,6 +3111,7 @@ def send_controls_task():
 
     # Mode mapping for display
     mode_map = {
+        "EV2_CHASING_EVADE": "EV2: CHASING EVADE",
         "EV1_DARKNESS": "🌑 EV1: DARKNESS",
         "EV2_RED_TOKEN": "🚨 EV2: POLICE",
         "EV2_POLICE_EVADE": "🚨 EV2: POLICE EVADE",
