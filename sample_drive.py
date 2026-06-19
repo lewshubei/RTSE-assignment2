@@ -1677,68 +1677,119 @@ def select_green_target(green_tokens, previous_target, frame_width, frame_height
     return best_global, reachable
 
 def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane, front_frame):
-    global locked_green_lane, locked_green_until, last_token_lane, last_token_time, committed_target_lane, committed_target_until, committed_target_reason, locked_green_target, locked_green_target_frames, locked_green_target_missing_frames
+    global locked_green_lane, locked_green_until, last_token_lane, last_token_time
+    global committed_target_lane, committed_target_until, committed_target_reason
+    global locked_green_target, locked_green_target_frames, locked_green_target_missing_frames
 
     now = time.time()
-    collected = None
+    best_token = None
+    best_score = -1
 
     for token in tokens:
+
+        # ----------------------------
+        # BASIC POSITION FILTER
+        # ----------------------------
         ny = token['y'] / float(frame_height)
         if ny < 0.85:
             continue
 
-        token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
-        
-        # Confirm lane alignment before counting
-        if token_lane != current_lane:
+        token_lane = lane_from_x(
+            token['x'], token['y'],
+            frame_width=frame_width,
+            frame_height=frame_height
+        )
+
+        # ----------------------------
+        # LANE TOLERANCE (FIX JITTER ISSUE)
+        # ----------------------------
+        if abs(token_lane - current_lane) > 0:
             continue
 
+        # ----------------------------
+        # COLOR DETECTION
+        # ----------------------------
         true_color = token.get('true_color', token.get('color'))
         if true_color not in ['green', 'yellow', 'red']:
-            true_color = detect_token_color_robust(front_frame, token['x'], token['y'], token['radius'])
-        
-        if true_color not in ['green', 'yellow', 'red']:
+            true_color = detect_token_color_robust(
+                front_frame,
+                token['x'],
+                token['y'],
+                token['radius']
+            )
+
+        # ----------------------------
+        # HARD COLOR FILTER (NO YELLOW EVER)
+        # ----------------------------
+        if true_color == 'yellow':
+            continue
+
+        if true_color not in ['green', 'red']:
+            continue
+
+        # ----------------------------
+        # EV2 RULE: RED ONLY DURING POLICE EVENT
+        # ----------------------------
+        if true_color == 'red' and not shared_data.get('ev2_police_active', False):
             continue
 
         token_id = f"{token_lane}:{true_color}"
 
+        # ----------------------------
+        # COOLDOWN CHECK
+        # ----------------------------
         with data_lock:
             recent_collections = shared_data.get('last_collected_by_lane_color', {})
-            recent_same_token = (
-                now - recent_collections.get(token_id, 0.0) < TOKEN_COLLECTION_COOLDOWN_SECONDS
-            )
+            if now - recent_collections.get(token_id, 0.0) < TOKEN_COLLECTION_COOLDOWN_SECONDS:
+                continue
 
-        if recent_same_token:
-            continue
+        # ----------------------------
+        # PRIORITY SCORING SYSTEM
+        # ----------------------------
+        distance_score = 1.0 - ny              # closer = higher score
+        color_weight = 1.5 if true_color == 'green' else 1.0
 
-        collected = (token_id, true_color)
-        break
+        score = distance_score * color_weight
 
-    if collected is None:
+        if score > best_score:
+            best_score = score
+            best_token = (token_id, true_color, current_lane)
+
+    # ----------------------------
+    # NO VALID TOKEN
+    # ----------------------------
+    if best_token is None:
         return
 
-    token_id, color = collected
+    token_id, color, lane = best_token
+
+    # ----------------------------
+    # COMMIT COLLECTION
+    # ----------------------------
     with data_lock:
         shared_data['last_collected_line_id'] = token_id
         shared_data['last_collected_time'] = now
         shared_data['last_collected_by_lane_color'][token_id] = now
         shared_data['run_summary'][f'{color}_collected'] += 1
-        
-        # EV2: Check if red token collected during police event
+
+        # EV2 RED SUCCESS FLAG
         if color == 'red' and shared_data.get('ev2_police_active', False):
             shared_data['ev2_red_token_collected'] = True
-            print(f"[EV2] Red token collected! Police threat neutralized.")
+            print("[EV2] Red token collected during police event!")
 
-    if color == 'yellow':
-        start_random_yellow_effect()
-    elif color == 'green':
+    # ----------------------------
+    # SIDE EFFECTS
+    # ----------------------------
+    if color == 'green':
         locked_green_lane = current_lane
         locked_green_until = now + 0.8
         locked_green_target = None
         locked_green_target_frames = 0
         locked_green_target_missing_frames = 0
+
         last_token_lane = current_lane
         last_token_time = now
+
         committed_target_lane = current_lane
         committed_target_until = now + 0.8
         committed_target_reason = "MAINTAIN"
