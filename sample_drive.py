@@ -1614,20 +1614,24 @@ def green_rejection_reason(token, frame_width, frame_height, current_lane, block
 def is_reachable_green_token(token, frame_width, frame_height, current_lane, blocked_lanes):
     return green_rejection_reason(token, frame_width, frame_height, current_lane, blocked_lanes) is None
 
-def green_target_score(token, frame_width, frame_height, current_lane):
-    token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width)
-    center_error = abs(token['x'] - (frame_width / 2.0)) / (frame_width / 2.0)
-    lane_center_error = abs(token['x'] - get_lane_center_x(token_lane, frame_width)) / (frame_width / 5.0)
-    lane_change_cost = abs(token_lane - current_lane) * 0.01
-    y_ratio = token['y'] / float(frame_height)
-    future_bonus = 80.0 if 0.25 <= y_ratio <= 0.75 else 0.0
-    return (
-        token['y'] * 2.0
-        + future_bonus
-        - center_error * 120.0
-        - lane_center_error * 60.0
-        - lane_change_cost * frame_width
-    )
+def green_target_score(token, frame_width, frame_height, current_lane, prev_ny=None):
+    nx = token['x'] / float(frame_width)
+    ny = token['y'] / float(frame_height)
+    
+    if prev_ny is not None:
+        predicted_ny = ny + (ny - prev_ny)
+    else:
+        velocity_estimate = 0.05
+        predicted_ny = ny + velocity_estimate
+        
+    predicted_ny = max(0.0, min(1.0, predicted_ny))
+    
+    token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
+    lane_bonus = 1.0 if token_lane == current_lane else 0.0
+    center_alignment = 1.0 - abs(nx - 0.5)
+    
+    score = ((1.0 - predicted_ny) * 0.5) + (lane_bonus * 0.3) + (center_alignment * 0.2)
+    return score
 
 def select_green_target(green_tokens, previous_target, frame_width, frame_height, current_lane, blocked_lanes):
     reachable = [
@@ -1637,36 +1641,56 @@ def select_green_target(green_tokens, previous_target, frame_width, frame_height
     if not reachable:
         return None, []
 
-    if previous_target:
-        previous_x = previous_target.get('x')
-        previous_y = previous_target.get('y')
-        if previous_x is not None and previous_y is not None:
-            lock_radius = max(45.0, frame_width * 0.11)
-            locked_candidates = []
-            for token in reachable:
-                dx = token['x'] - previous_x
-                dy = token['y'] - previous_y
-                if (dx * dx + dy * dy) <= lock_radius * lock_radius:
-                    locked_candidates.append(token)
-            if locked_candidates:
-                return max(locked_candidates, key=lambda t: green_target_score(t, frame_width, frame_height, current_lane)), reachable
+    # Phase 3: Group tokens by lane
+    lane_map = { -2: [], -1: [], 0: [], 1: [], 2: [] }
+    for token in reachable:
+        lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
+        lane = max(-2, min(2, lane))
+        lane_map[lane].append(token)
 
-    return max(reachable, key=lambda t: green_target_score(t, frame_width, frame_height, current_lane)), reachable
+    now = time.time()
+    target_lane = None
+
+    # Priority 1: Locked lane (Lane Commitment Window)
+    locked_lane = globals().get('locked_green_lane')
+    locked_until = globals().get('locked_green_until', 0.0)
+    
+    if locked_lane is not None and now < locked_until:
+        if len(lane_map.get(locked_lane, [])) > 0:
+            target_lane = locked_lane
+
+    # Priority 2: Same lane (Stay in lane if productive)
+    if target_lane is None:
+        if len(lane_map.get(current_lane, [])) > 0:
+            target_lane = current_lane
+
+    prev_ny = None
+    if previous_target and 'y' in previous_target:
+        prev_ny = previous_target['y'] / float(frame_height)
+
+    if target_lane is not None:
+        best_in_lane = max(lane_map[target_lane], key=lambda t: green_target_score(t, frame_width, frame_height, current_lane, prev_ny))
+        return best_in_lane, reachable
+
+    # Priority 3: Best globally
+    best_global = max(reachable, key=lambda t: green_target_score(t, frame_width, frame_height, current_lane, prev_ny))
+    return best_global, reachable
 
 def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane, front_frame):
     global locked_green_lane, locked_green_until, last_token_lane, last_token_time, committed_target_lane, committed_target_until, committed_target_reason, locked_green_target, locked_green_target_frames, locked_green_target_missing_frames
 
     now = time.time()
-    collection_y = frame_height * TOKEN_COLLECTION_Y_RATIO
     collected = None
 
     for token in tokens:
-        if token['y'] < collection_y:
+        ny = token['y'] / float(frame_height)
+        if ny < 0.85:
             continue
 
         token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
-        token_is_centered = abs(token['x'] - (frame_width / 2.0)) <= frame_width * 0.16
-        if token_lane != current_lane and not token_is_centered:
+        
+        # Confirm lane alignment before counting
+        if token_lane != current_lane:
             continue
 
         true_color = token.get('true_color', token.get('color'))
@@ -1708,15 +1732,15 @@ def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane
     if color == 'yellow':
         start_random_yellow_effect()
     elif color == 'green':
-        locked_green_lane = None
-        locked_green_until = 0.0
+        locked_green_lane = current_lane
+        locked_green_until = now + 0.8
         locked_green_target = None
         locked_green_target_frames = 0
         locked_green_target_missing_frames = 0
-        last_token_lane = None
-        last_token_time = 0.0
-        committed_target_lane = None
-        committed_target_until = 0.0
+        last_token_lane = current_lane
+        last_token_time = now
+        committed_target_lane = current_lane
+        committed_target_until = now + 0.8
         committed_target_reason = "MAINTAIN"
 
 def apply_camera_effects(front_frame):
