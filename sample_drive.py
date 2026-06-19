@@ -2943,7 +2943,7 @@ def send_controls_task():
     if decision_reason == "MAINTAIN" and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active, ev5_golden_lane_active]):
         selected_green_target, reachable_green_tokens = select_green_target(
             green_tokens_visible,
-            None,
+            locked_green_target,
             img_w,
             img_h,
             current_lane,
@@ -2951,6 +2951,10 @@ def send_controls_task():
         )
 
         if selected_green_target is not None:
+            locked_green_target = selected_green_target
+            locked_green_target_frames += 1
+            locked_green_target_missing_frames = 0
+
             target_lane = lane_from_x(
                 selected_green_target['x'],
                 selected_green_target['y'],
@@ -2958,8 +2962,7 @@ def send_controls_task():
                 frame_height=img_h
             )
             desired_lane = max(-2, min(2, target_lane))
-            target_y_ratio = selected_green_target['y'] / float(img_h)
-            decision_reason = "GREEN_TARGET" if target_y_ratio >= GREEN_COLLECT_Y_RATIO else "PRE_TARGET_GREEN"
+            decision_reason = "GREEN_TARGET"
             selected_target_type = "GREEN"
             acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
             
@@ -2972,6 +2975,12 @@ def send_controls_task():
             )
         else:
             green_reject_counts['no_lock'] = len(green_tokens_visible)
+            
+            if locked_green_target is not None:
+                locked_green_target_missing_frames += 1
+                if locked_green_target_missing_frames > 5:
+                    locked_green_target = None
+                    locked_green_target_frames = 0
 
             # =========================================================
             # GLOBAL FALLBACK POLICY
@@ -2992,7 +3001,7 @@ def send_controls_task():
                     steering_input = apply_tap_steering(desired_lane)
                 target_debug = f"fallback_maintain:L{current_lane}"
 
-    if decision_reason not in ("GREEN_TARGET", "PRE_TARGET_GREEN") and locked_green_target_frames > 0:
+    if decision_reason != "GREEN_TARGET" and locked_green_target_frames > 0:
         locked_green_target_frames = 0
         locked_green_target = None
         locked_green_target_missing_frames = 0
@@ -3026,7 +3035,6 @@ def send_controls_task():
         "POLICE_EVADE": "POLICE MODE",
         "POLICE_RED_TOKEN": "POLICE MODE",
         "TRAILING_EVADE": "TRAILING CAR AVOID",
-        "PRE_TARGET_GREEN": "PRE_TARGET_GREEN",
         "GREEN_TARGET": "COLLECT_GREEN",
         "AVOID_RED": "AVOID RED",
         "AVOID_YELLOW": "AVOID YELLOW",
@@ -3075,7 +3083,7 @@ def send_controls_task():
             'missing_frames': locked_green_target_missing_frames,
             'reject': dict(green_reject_counts)
         }
-        if selected_green_target is not None and decision_reason in ("GREEN_TARGET", "PRE_TARGET_GREEN"):
+        if selected_green_target is not None and decision_reason == "GREEN_TARGET":
             shared_data['green_target_debug'] = {
                 'x': int(selected_green_target['x']),
                 'y': int(selected_green_target['y']),
