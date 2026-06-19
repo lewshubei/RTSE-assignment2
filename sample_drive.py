@@ -1616,18 +1616,6 @@ def clamp(value, min_value, max_value):
 def green_rejection_reason(token, frame_width, frame_height, current_lane, blocked_lanes):
     if token.get('color') != 'green':
         return "not_green"
-    x = token.get('x', 0)
-    y = token.get('y', 0)
-    if y < frame_height * GREEN_DECISION_MIN_Y_RATIO:
-        return "too_far"
-    if y > frame_height * GREEN_ROAD_Y_MAX_RATIO:
-        return "outside_roi"
-    if x < frame_width * GREEN_ROAD_X_MARGIN_RATIO or x > frame_width * (1.0 - GREEN_ROAD_X_MARGIN_RATIO):
-        return "outside_roi"
-
-    token_lane = lane_from_x(x, y, frame_width=frame_width, frame_height=frame_height)
-    if token_lane in blocked_lanes:
-        return "blocked_by_hazard"
     return None
 
 def is_reachable_green_token(token, frame_width, frame_height, current_lane, blocked_lanes):
