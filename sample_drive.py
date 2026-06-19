@@ -1606,25 +1606,15 @@ def get_safe_lane(current_lane, hazard_lanes, frame_width, bonus_lanes=None):
 def clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
 
-def is_valid_token(token, police_detected):
-    color = token.get('color')
-    if color == 'green':
-        return True
-    if color == 'yellow':
-        return False
-    if color == 'red':
-        return police_detected
-    return False
-
-def target_rejection_reason(token, frame_width, frame_height, current_lane, blocked_lanes, police_detected):
-    if not is_valid_token(token, police_detected):
-        return "invalid_state"
+def green_rejection_reason(token, frame_width, frame_height, current_lane, blocked_lanes):
+    if token.get('color') != 'green':
+        return "not_green"
     return None
 
-def is_reachable_target_token(token, frame_width, frame_height, current_lane, blocked_lanes, police_detected):
-    return target_rejection_reason(token, frame_width, frame_height, current_lane, blocked_lanes, police_detected) is None
+def is_reachable_green_token(token, frame_width, frame_height, current_lane, blocked_lanes):
+    return green_rejection_reason(token, frame_width, frame_height, current_lane, blocked_lanes) is None
 
-def target_score(token, frame_width, frame_height, current_lane, prev_ny=None, police_detected=False):
+def green_target_score(token, frame_width, frame_height, current_lane, prev_ny=None):
     nx = token['x'] / float(frame_width)
     ny = token['y'] / float(frame_height)
     
@@ -1641,18 +1631,12 @@ def target_score(token, frame_width, frame_height, current_lane, prev_ny=None, p
     center_alignment = 1.0 - abs(nx - 0.5)
     
     score = ((1.0 - predicted_ny) * 0.5) + (lane_bonus * 0.3) + (center_alignment * 0.2)
-    
-    if token.get('color') == 'red' and police_detected:
-        score += 10.0
-        
     return score
 
-def select_target(valid_tokens, previous_target, frame_width, frame_height, current_lane, blocked_lanes, police_detected):
-    global locked_green_lane, locked_green_until
-
+def select_green_target(green_tokens, previous_target, frame_width, frame_height, current_lane, blocked_lanes):
     reachable = [
-        token for token in valid_tokens
-        if is_reachable_target_token(token, frame_width, frame_height, current_lane, blocked_lanes, police_detected)
+        token for token in green_tokens
+        if is_reachable_green_token(token, frame_width, frame_height, current_lane, blocked_lanes)
     ]
     if not reachable:
         return None, []
@@ -1685,11 +1669,11 @@ def select_target(valid_tokens, previous_target, frame_width, frame_height, curr
         prev_ny = previous_target['y'] / float(frame_height)
 
     if target_lane is not None:
-        best_in_lane = max(lane_map[target_lane], key=lambda t: target_score(t, frame_width, frame_height, current_lane, prev_ny, police_detected))
+        best_in_lane = max(lane_map[target_lane], key=lambda t: green_target_score(t, frame_width, frame_height, current_lane, prev_ny))
         return best_in_lane, reachable
 
     # Priority 3: Best globally
-    best_global = max(reachable, key=lambda t: target_score(t, frame_width, frame_height, current_lane, prev_ny, police_detected))
+    best_global = max(reachable, key=lambda t: green_target_score(t, frame_width, frame_height, current_lane, prev_ny))
     return best_global, reachable
 
 def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane, front_frame):
@@ -1697,9 +1681,6 @@ def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane
 
     now = time.time()
     collected = None
-    
-    with data_lock:
-        police_detected = shared_data.get('police_detected', False) or shared_data.get('ev2_police_active', False)
 
     for token in tokens:
         ny = token['y'] / float(frame_height)
@@ -1715,10 +1696,8 @@ def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane
         true_color = token.get('true_color', token.get('color'))
         if true_color not in ['green', 'yellow', 'red']:
             true_color = detect_token_color_robust(front_frame, token['x'], token['y'], token['radius'])
-            
-        temp_token = token.copy()
-        temp_token['color'] = true_color
-        if not is_valid_token(temp_token, police_detected):
+        
+        if true_color not in ['green', 'yellow', 'red']:
             continue
 
         token_id = f"{token_lane}:{true_color}"
@@ -1752,7 +1731,7 @@ def maybe_record_collected_token(tokens, frame_width, frame_height, current_lane
 
     if color == 'yellow':
         start_random_yellow_effect()
-    elif color == 'green' or color == 'red':
+    elif color == 'green':
         locked_green_lane = current_lane
         locked_green_until = now + 0.8
         locked_green_target = None
@@ -2564,13 +2543,40 @@ def send_controls_task():
         
         if int(elapsed * 2) != int((elapsed - 0.02) * 2):
             print(f"[EV2] 🚨 POLICE ACTIVE! {remaining:.1f}s to collect RED token!")
+        
+        red_tokens = [t for t in tokens_snapshot if t.get('color') == 'red' and t['y'] >= TOKEN_DECISION_Y_MIN and t['y'] < img_h * 0.9]
+        
+        if red_tokens:
+            target_red = max(red_tokens, key=lambda t: (t['y'], -abs(t['x'] - (img_w / 2.0))))
+            red_lane = lane_from_x(target_red['x'], target_red['y'], frame_width=img_w, frame_height=img_h)
             
-        if police_front_detected and police_front_lane == current_lane:
-            safe_lane = get_safe_lane(current_lane, {current_lane, police_front_lane}, img_w)
-            if safe_lane != current_lane:
-                desired_lane = safe_lane
-                decision_reason = "EV2_POLICE_EVADE"
-                steering_input = apply_tap_steering(safe_lane)
+            desired_lane = red_lane
+            decision_reason = "EV2_RED_TOKEN"
+            selected_target_type = "RED"
+            acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
+            
+            if police_front_detected and police_front_lane == current_lane:
+                safe_lane = get_safe_lane(current_lane, {current_lane, police_front_lane}, img_w)
+                if safe_lane != current_lane:
+                    desired_lane = safe_lane
+                    decision_reason = "EV2_POLICE_EVADE"
+                    steering_input = apply_tap_steering(safe_lane)
+            
+            if target_red['y'] >= img_h * 0.85:
+                with data_lock:
+                    shared_data['ev2_red_token_collected'] = True
+                    shared_data['red_token_collected_during_police'] = True
+                    shared_data['ev2_police_active'] = False
+                    shared_data['run_summary']['red_collected'] += 1
+                decision_reason = "EV2_RED_COLLECTED"
+                selected_target_type = "EV2_COMPLETE"
+        else:
+            if police_front_detected and police_front_lane == current_lane:
+                safe_lane = get_safe_lane(current_lane, {current_lane, police_front_lane}, img_w)
+                if safe_lane != current_lane:
+                    desired_lane = safe_lane
+                    decision_reason = "EV2_POLICE_EVADE"
+                    steering_input = apply_tap_steering(safe_lane)
         
         if elapsed > 5.0 and not ev2_red_collected:
             with data_lock:
@@ -2831,24 +2837,24 @@ def send_controls_task():
     for t in yellow_hazard_tokens:
         yellow_hazard_lanes.add(lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h))
 
-    valid_tokens_for_bonus = [t for t in tokens_snapshot if is_valid_token(t, police_detected) and t['y'] >= TOKEN_DECISION_Y_MIN]
+    green_tokens_for_bonus = [t for t in tokens_snapshot if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN]
     bonus_lanes = set()
-    for t in valid_tokens_for_bonus:
+    for t in green_tokens_for_bonus:
         t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
         bonus_lanes.add(t_lane)
-    valid_tokens = [t for t in tokens_snapshot if is_valid_token(t, police_detected)]
-    valid_reject_counts = {
-        'candidate': len(valid_tokens),
+    green_tokens_visible = [t for t in tokens_snapshot if t.get('color') == 'green']
+    green_reject_counts = {
+        'candidate': len(green_tokens_visible),
         'too_far': 0,
         'outside_roi': 0,
         'blocked_by_hazard': 0,
         'event_override': 0,
         'no_lock': 0,
     }
-    for token in valid_tokens:
-        reason = target_rejection_reason(token, img_w, img_h, current_lane, hazard_lanes, police_detected)
+    for token in green_tokens_visible:
+        reason = green_rejection_reason(token, img_w, img_h, current_lane, hazard_lanes)
         if reason:
-            valid_reject_counts[reason] = valid_reject_counts.get(reason, 0) + 1
+            green_reject_counts[reason] = green_reject_counts.get(reason, 0) + 1
 
     if decision_reason in ("MAINTAIN", "POLICE_RED_TOKEN") and (current_lane in red_hazard_lanes or desired_lane in red_hazard_lanes):
         safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
@@ -2881,42 +2887,40 @@ def send_controls_task():
             steering_input = apply_tap_steering(desired_lane)
 
     # =========================================================
-    # TOKEN DECISION - Seek reachable TARGET tokens (only if no EV is active)
+    # TOKEN DECISION - Seek reachable GREEN tokens (only if no EV is active)
     # =========================================================
-    if decision_reason == "MAINTAIN" and not any([ev1_darkness_active, ev3_chasing1_active, ev4_chasing2_active, ev5_golden_lane_active]):
-        selected_target, reachable_tokens = select_target(
-            valid_tokens,
+    if decision_reason == "MAINTAIN" and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active, ev5_golden_lane_active]):
+        selected_green_target, reachable_green_tokens = select_green_target(
+            green_tokens_visible,
             None,
             img_w,
             img_h,
             current_lane,
-            hazard_lanes,
-            police_detected
+            hazard_lanes
         )
 
-        if selected_target is not None:
+        if selected_green_target is not None:
             target_lane = lane_from_x(
-                selected_target['x'],
-                selected_target['y'],
+                selected_green_target['x'],
+                selected_green_target['y'],
                 frame_width=img_w,
                 frame_height=img_h
             )
             desired_lane = max(-2, min(2, target_lane))
-            target_y_ratio = selected_target['y'] / float(img_h)
-            color_prefix = selected_target.get('color', 'green').upper()
-            decision_reason = f"{color_prefix}_TARGET" if target_y_ratio >= GREEN_COLLECT_Y_RATIO else f"PRE_TARGET_{color_prefix}"
-            selected_target_type = color_prefix
+            target_y_ratio = selected_green_target['y'] / float(img_h)
+            decision_reason = "GREEN_TARGET" if target_y_ratio >= GREEN_COLLECT_Y_RATIO else "PRE_TARGET_GREEN"
+            selected_target_type = "GREEN"
             acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
             
             if decision_reason not in ("FRONT_POLICE_EVADE", "FRONT_CHASING_EVADE", "POLICE_EVADE", "TRAILING_EVADE", "EV3_CHASING_EVADE", "EV4_CHASING_EVADE"):
                 steering_input = apply_tap_steering(desired_lane)
 
             target_debug = (
-                f"target:{selected_target['x']},{selected_target['y']} "
-                f"reach:{len(reachable_tokens)}"
+                f"green_target:{selected_green_target['x']},{selected_green_target['y']} "
+                f"reach:{len(reachable_green_tokens)}"
             )
         else:
-            valid_reject_counts['no_lock'] = len(valid_tokens)
+            green_reject_counts['no_lock'] = len(green_tokens_visible)
 
             # =========================================================
             # GLOBAL FALLBACK POLICY
