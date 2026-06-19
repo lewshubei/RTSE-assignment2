@@ -1662,10 +1662,21 @@ def select_green_target(green_tokens, previous_target, frame_width, frame_height
         if len(lane_map.get(locked_lane, [])) > 0:
             target_lane = locked_lane
 
-    # Priority 2: Same lane (Stay in lane if productive)
+    # Priority 2: Most productive lane (Streak potential)
     if target_lane is None:
-        if len(lane_map.get(current_lane, [])) > 0:
-            target_lane = current_lane
+        best_count = 0
+        best_lane = None
+        for l, tokens in lane_map.items():
+            count = len(tokens)
+            if count > best_count:
+                best_count = count
+                best_lane = l
+            elif count == best_count and count > 0:
+                if l == current_lane:
+                    best_lane = current_lane
+        
+        if best_lane is not None:
+            target_lane = best_lane
 
     prev_ny = None
     if previous_target and 'y' in previous_target:
