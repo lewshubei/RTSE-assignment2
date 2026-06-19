@@ -93,60 +93,50 @@ YELLOW_EFFECTS = [
 ]
 
 # Light detection tunables - SUPER FAST RECOVERY
-LOWLIGHT_DARK_THRESHOLD = 0.55
-LOWLIGHT_RECOVERY_THRESHOLD = 0.65
-LOWLIGHT_MIN_BASELINE = 30.0
+LOWLIGHT_DARK_THRESHOLD = 0.45  # Lowered for faster detection
+LOWLIGHT_RECOVERY_THRESHOLD = 0.60  # Lowered for faster recovery
+LOWLIGHT_MIN_BASELINE = 25.0
 LOWLIGHT_EVENT_WINDOW_SECONDS = 10.0
-LOWLIGHT_RECOVERY_INTERVAL = 0.2
-LOWLIGHT_FAST_RECOVERY_COUNT = 2
+LOWLIGHT_RECOVERY_INTERVAL = 0.05  # FASTER: 50ms between recovery attempts
+LOWLIGHT_FAST_RECOVERY_COUNT = 5  # More recovery attempts
+LOWLIGHT_CONFIRM_FRAMES = 3  # Fewer frames to confirm darkness
+LOWLIGHT_RECOVERY_FRAMES = 2  # Fewer frames to confirm recovery
 
-# Police car detection tunables - IMPROVED ACCURACY
-POLICE_CONFIRM_FRAMES = 5  # Increased from 3 to reduce false positives
+# Police car detection - Based on split red/blue color scheme
+POLICE_CONFIRM_FRAMES = 5
 POLICE_SEEK_ACCELERATION = 0.70
-POLICE_ROI_X_START = 0.10  # Expanded ROI
-POLICE_ROI_X_END = 0.90
-POLICE_ROI_Y_START = 0.30
-POLICE_ROI_Y_END = 0.95
-POLICE_MIN_AREA = 1500  # Increased minimum area
+POLICE_MIN_AREA = 1500
 POLICE_MAX_AREA = 60000
-POLICE_MIN_RED_RATIO = 0.15  # Stricter thresholds
+POLICE_MIN_RED_RATIO = 0.15
 POLICE_MIN_BLUE_RATIO = 0.15
-POLICE_SPLIT_RATIO_MIN = 0.30  # Stricter split ratio
+POLICE_SPLIT_RATIO_MIN = 0.30
 POLICE_SPLIT_RATIO_MAX = 0.70
-POLICE_MIN_RED_PIXELS = 300  # Increased minimum pixels
+POLICE_MIN_RED_PIXELS = 300
 POLICE_MIN_BLUE_PIXELS = 300
-POLICE_CONFIDENCE_THRESHOLD = 0.65  # Higher threshold
-POLICE_RED_TARGET_START_SECONDS = 0.0
-POLICE_EVENT_TIMEOUT_SECONDS = 5.0  # EV2 requires red token within 5 seconds
+POLICE_CONFIDENCE_THRESHOLD = 0.65
+POLICE_EVENT_TIMEOUT_SECONDS = 5.0  # EV2: 5 seconds to collect red token
 
-# Police car color ranges - MORE SPECIFIC
-POLICE_RED_LOWER1 = np.array([0, 80, 60])  # More saturated
+# Police car color ranges - Split Red/Blue
+POLICE_RED_LOWER1 = np.array([0, 80, 60])
 POLICE_RED_UPPER1 = np.array([10, 255, 255])
 POLICE_RED_LOWER2 = np.array([170, 80, 60])
 POLICE_RED_UPPER2 = np.array([180, 255, 255])
-POLICE_BLUE_LOWER = np.array([100, 80, 60])  # More saturated
+POLICE_BLUE_LOWER = np.array([100, 80, 60])
 POLICE_BLUE_UPPER = np.array([130, 255, 255])
 
-# Trailing car detection tunables - IMPROVED
-TRAILING_CONFIRM_FRAMES = 4  # Increased for stability
-TRAILING_DODGE_HOLD_SECONDS = 2.0
-TRAILING_MOTION_AREA_MIN = 3000  # Increased minimum
+# Trailing/Chasing car detection - Based on Cyan/Teal color scheme
+TRAILING_CONFIRM_FRAMES = 4
+TRAILING_MOTION_AREA_MIN = 3000
 TRAILING_APPROACH_RATIO = 1.05
-TRAILING_ROI_X_START = 0.10
-TRAILING_ROI_X_END = 0.90
-TRAILING_ROI_Y_START = 0.25
-TRAILING_ROI_Y_END = 0.95
 TRAILING_ASPECT_RATIO_MIN = 0.3
 TRAILING_ASPECT_RATIO_MAX = 3.0
 TRAILING_MIN_HEIGHT_RATIO = 0.08
 
-# Trailing car color ranges - MORE SPECIFIC with multiple ranges
+# Trailing car color ranges - Cyan/Teal
 TRAILING_CYAN_LOWER1 = np.array([80, 70, 70])
 TRAILING_CYAN_UPPER1 = np.array([110, 255, 255])
 TRAILING_CYAN_LOWER2 = np.array([75, 60, 100])
 TRAILING_CYAN_UPPER2 = np.array([105, 255, 255])
-TRAILING_CYAN_LOWER3 = np.array([85, 80, 60])
-TRAILING_CYAN_UPPER3 = np.array([110, 255, 200])
 
 LANE_FOLLOW_SMOOTHING_PREVIOUS = 0.70
 LANE_FOLLOW_SMOOTHING_CURRENT = 0.30
@@ -189,7 +179,6 @@ shared_data = {
     'lights_on': True,
     'police_detected': False,
     'trailing_detected': False,
-    'back_prev_gray': None,
     'back_prev_area': 0.0,
     'run_summary': {
         'green_collected': 0,
@@ -245,9 +234,6 @@ shared_data = {
     'police_detection_history': [],
     'police_lane': None,
     'trailing_lane': None,
-    'emergency_evasion': False,
-    'evasion_target_lane': None,
-    'evasion_start_time': 0.0,
     'lane_follow': {
         'lane_center_x': None,
         'left_line': None,
@@ -267,13 +253,11 @@ shared_data = {
         'police_confidence': 0.0,
         'police_bbox': None,
         'police_lane': None,
-        'police_detection_count': 0
     },
-    # Front detection shared data
+    # Front detection
     'police_front_detected': False,
     'police_front_lane': None,
     'police_front_confidence': 0.0,
-    'police_front_distance': None,
     'police_front_bbox': None,
     'chasing_front_detected': False,
     'chasing_front_lane': None,
@@ -290,6 +274,10 @@ shared_data = {
     'speed_modifier': 1.0,
     'selected_target_type': 'NONE',
     'current_mode': 'LANE FOLLOW',
+    # Light detection confirmation
+    'light_confirm_count': 0,
+    'recovery_confirm_count': 0,
+    'last_recovery_burst_time': 0.0,
     # EV tracking
     'ev1_darkness_active': False,
     'ev1_darkness_brake_sent': False,
@@ -1289,26 +1277,25 @@ def lane_from_x(x, y=None, frame_width=640, frame_height=480):
         return 2
 
 # =========================================================
-# IMPROVED POLICE CAR DETECTION - MORE ACCURATE
+# POLICE CAR DETECTION - Split Red/Blue Color Scheme
 # =========================================================
-def detect_police_car_accurate(back_frame):
+def detect_police_car(frame):
     """
-    ACCURATE police car detection with strict filtering to reduce false positives.
-    Police car = split red/blue color scheme on a single vehicle.
-    Uses dual validation to prevent false positives.
+    Detect police car using split red/blue color scheme.
+    Police car = vehicle with both vibrant red and deep blue next to each other.
     """
-    if back_frame is None:
+    if frame is None:
         return False, 0.0, None, None
 
-    frame_h, frame_w = back_frame.shape[:2]
+    frame_h, frame_w = frame.shape[:2]
 
-    # Use a more focused ROI - police cars appear in the center/lower portion
-    roi_x1 = int(frame_w * 0.15)
-    roi_x2 = int(frame_w * 0.85)
-    roi_y1 = int(frame_h * 0.35)
+    # Focus on where cars appear
+    roi_x1 = int(frame_w * 0.10)
+    roi_x2 = int(frame_w * 0.90)
+    roi_y1 = int(frame_h * 0.25)
     roi_y2 = int(frame_h * 0.95)
 
-    roi = back_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+    roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
     roi_h, roi_w = roi.shape[:2]
     
     if roi_h < 50 or roi_w < 50:
@@ -1316,46 +1303,36 @@ def detect_police_car_accurate(back_frame):
     
     hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     
-    # Red masks - more restrictive
+    # Red masks
     red_mask1 = cv2.inRange(hsv_roi, POLICE_RED_LOWER1, POLICE_RED_UPPER1)
     red_mask2 = cv2.inRange(hsv_roi, POLICE_RED_LOWER2, POLICE_RED_UPPER2)
     red_mask = cv2.bitwise_or(red_mask1, red_mask2)
     
-    # Blue mask - more restrictive
+    # Blue mask
     blue_mask = cv2.inRange(hsv_roi, POLICE_BLUE_LOWER, POLICE_BLUE_UPPER)
     
-    # Morphological operations to clean up
+    # Clean up
     kernel = np.ones((3, 3), np.uint8)
     red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
     red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
     blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
     blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
     
-    # Get total pixels for ratio calculations
-    total_roi_pixels = roi_h * roi_w
-    
-    # Count total red and blue pixels in the entire ROI
+    # Count total pixels
     total_red_pixels = cv2.countNonZero(red_mask)
     total_blue_pixels = cv2.countNonZero(blue_mask)
     
-    # Require significant number of both colors in the ROI
-    if total_red_pixels < 500 or total_blue_pixels < 500:
+    # Require significant amounts of both colors
+    if total_red_pixels < 300 or total_blue_pixels < 300:
         return False, 0.0, None, None
-    
-    # Check the ratio of red to blue in the ROI (should be somewhat balanced)
-    if total_red_pixels > 0 and total_blue_pixels > 0:
-        ratio = total_red_pixels / total_blue_pixels
-        if ratio < 0.3 or ratio > 3.0:  # Not balanced enough
-            return False, 0.0, None, None
     
     # Find red regions
     red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     red_regions = []
     for cnt in red_contours:
         area = cv2.contourArea(cnt)
-        if area > 300:  # Minimum area for red region
+        if area > 200:
             x, y, w, h = cv2.boundingRect(cnt)
-            # Check aspect ratio - red regions on police car are somewhat rectangular
             if 0.3 <= w / max(1, h) <= 4.0:
                 red_regions.append((x, y, w, h, area))
     
@@ -1364,31 +1341,29 @@ def detect_police_car_accurate(back_frame):
     blue_regions = []
     for cnt in blue_contours:
         area = cv2.contourArea(cnt)
-        if area > 300:  # Minimum area for blue region
+        if area > 200:
             x, y, w, h = cv2.boundingRect(cnt)
-            # Check aspect ratio - blue regions on police car are somewhat rectangular
             if 0.3 <= w / max(1, h) <= 4.0:
                 blue_regions.append((x, y, w, h, area))
     
-    # Early exit if we don't have both colors
     if len(red_regions) < 1 or len(blue_regions) < 1:
         return False, 0.0, None, None
     
-    # Find red and blue regions that are close to each other (part of same car)
+    # Find red and blue regions close to each other
     best_confidence = 0.0
     best_bbox = None
     police_lane = None
     
     for rx, ry, rw, rh, rarea in red_regions:
         for bx, by, bw, bh, barea in blue_regions:
-            # Check if regions are close (within 200 pixels)
+            # Check proximity
             center_red_x = rx + rw/2
             center_red_y = ry + rh/2
             center_blue_x = bx + bw/2
             center_blue_y = by + bh/2
             
             dist = np.sqrt((center_red_x - center_blue_x)**2 + (center_red_y - center_blue_y)**2)
-            if dist > 300:  # Too far apart
+            if dist > 250:
                 continue
             
             # Combine bounding boxes
@@ -1401,16 +1376,14 @@ def detect_police_car_accurate(back_frame):
             combined_h = y2 - y1
             combined_area = combined_w * combined_h
             
-            # Police car should be a reasonable size
             if combined_area < POLICE_MIN_AREA or combined_area > POLICE_MAX_AREA:
                 continue
             
-            # Check aspect ratio - police cars are wider than tall
             aspect_ratio = float(combined_w) / combined_h if combined_h > 0 else 0
             if aspect_ratio < 0.5 or aspect_ratio > 3.0:
                 continue
             
-            # Check red/blue split within the combined region
+            # Verify split colors in combined region
             combined_roi = roi[y1:y2, x1:x2]
             if combined_roi.size == 0 or combined_roi.shape[0] < 20 or combined_roi.shape[1] < 20:
                 continue
@@ -1432,113 +1405,72 @@ def detect_police_car_accurate(back_frame):
             red_ratio = red_pixels / total_pixels
             blue_ratio = blue_pixels / total_pixels
             
-            # Both colors must be present in significant amounts
+            # Both colors must be present
             if red_ratio < 0.08 or blue_ratio < 0.08:
                 continue
             
-            # The split should be somewhat balanced (30-70% either color)
+            # Split should be balanced (30-70%)
             split_ratio = red_pixels / (red_pixels + blue_pixels) if (red_pixels + blue_pixels) > 0 else 0.5
-            
             if split_ratio < 0.25 or split_ratio > 0.75:
                 continue
             
-            # Calculate confidence with stricter criteria
+            # Calculate confidence
             confidence = 0.0
-            
-            # Color presence confidence (both colors must be present)
-            color_presence = min(1.0, (red_pixels / 500 + blue_pixels / 500) / 2.0)
+            color_presence = min(1.0, (red_pixels / 300 + blue_pixels / 300) / 2.0)
             confidence += color_presence * 0.40
-            
-            # Balance confidence (closer to 50/50 split is better)
             balance = 1.0 - abs(split_ratio - 0.5) * 2.0
             confidence += balance * 0.30
-            
-            # Size confidence - police cars should be substantial
-            area_factor = min(1.0, combined_area / 8000.0)
+            area_factor = min(1.0, combined_area / 5000.0)
             confidence += area_factor * 0.30
             
-            # Only accept if confidence is high enough and both colors are present
-            if confidence > best_confidence and confidence >= 0.65:
+            if confidence > best_confidence and confidence >= 0.60:
                 best_confidence = confidence
                 center_x = x1 + combined_w/2
                 center_y = y1 + combined_h/2
                 police_lane = lane_from_x(center_x + roi_x1, center_y + roi_y1, frame_width=frame_w, frame_height=frame_h)
                 best_bbox = (x1 + roi_x1, y1 + roi_y1, combined_w, combined_h)
     
-    # Final verification - require high confidence
-    if best_confidence >= 0.65 and best_bbox is not None:
-        # Double check by verifying both colors exist in the final region
-        x, y, w, h = best_bbox
-        x = max(0, x - roi_x1)
-        y = max(0, y - roi_y1)
-        verify_roi = roi[y:y+h, x:x+w]
-        if verify_roi.size > 0 and verify_roi.shape[0] > 10 and verify_roi.shape[1] > 10:
-            hsv_verify = cv2.cvtColor(verify_roi, cv2.COLOR_BGR2HSV)
-            red_verify = cv2.bitwise_or(
-                cv2.inRange(hsv_verify, POLICE_RED_LOWER1, POLICE_RED_UPPER1),
-                cv2.inRange(hsv_verify, POLICE_RED_LOWER2, POLICE_RED_UPPER2)
-            )
-            blue_verify = cv2.inRange(hsv_verify, POLICE_BLUE_LOWER, POLICE_BLUE_UPPER)
-            red_pixels = cv2.countNonZero(red_verify)
-            blue_pixels = cv2.countNonZero(blue_verify)
-            
-            # Require at least 300 pixels of each color in the final detection
-            if red_pixels >= 300 and blue_pixels >= 300:
-                print(f"[POLICE] Police car detected in lane {police_lane}! Confidence: {best_confidence:.2f}")
-                return True, best_confidence, best_bbox, police_lane
+    if best_confidence >= 0.60 and best_bbox is not None:
+        return True, best_confidence, best_bbox, police_lane
     
     return False, best_confidence, None, None
 
 # =========================================================
-# IMPROVED TRAILING CAR DETECTION - MORE ACCURATE
+# TRAILING/CHASING CAR DETECTION - Cyan/Teal Color Scheme
 # =========================================================
-def detect_trailing_car_enhanced(back_frame):
+def detect_trailing_car(frame):
     """
-    ENHANCED trailing car detection with stricter cyan/teal color detection.
+    Detect trailing/chasing car using cyan/teal color scheme.
     Trailing car = monochromatic cyan/teal vehicle.
-    Uses multiple color ranges and motion detection.
     """
-    if back_frame is None:
+    if frame is None:
         return False, 0.0, None, None
 
-    frame_h, frame_w = back_frame.shape[:2]
+    frame_h, frame_w = frame.shape[:2]
 
-    # Focused ROI for trailing car - expanded for better detection
     roi_x1 = int(frame_w * 0.10)
     roi_x2 = int(frame_w * 0.90)
     roi_y1 = int(frame_h * 0.25)
     roi_y2 = int(frame_h * 0.95)
 
-    roi = back_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+    roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
     roi_h, roi_w = roi.shape[:2]
     
     if roi_h < 50 or roi_w < 50:
         return False, 0.0, None, None
     
-    # Multiple cyan/teal ranges for better detection
-    cyan_ranges = [
-        # Standard cyan
-        (np.array([80, 70, 70]), np.array([110, 255, 255])),
-        # Lighter cyan
-        (np.array([75, 60, 100]), np.array([105, 255, 255])),
-        # Teal
-        (np.array([85, 80, 60]), np.array([110, 255, 200])),
-    ]
-    
     hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     
-    # Combine multiple cyan masks
-    cyan_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
-    for lower, upper in cyan_ranges:
-        mask = cv2.inRange(hsv_roi, lower, upper)
-        cyan_mask = cv2.bitwise_or(cyan_mask, mask)
+    # Cyan/Teal masks - multiple ranges for better detection
+    cyan_mask1 = cv2.inRange(hsv_roi, TRAILING_CYAN_LOWER1, TRAILING_CYAN_UPPER1)
+    cyan_mask2 = cv2.inRange(hsv_roi, TRAILING_CYAN_LOWER2, TRAILING_CYAN_UPPER2)
+    cyan_mask = cv2.bitwise_or(cyan_mask1, cyan_mask2)
     
-    # Morphological operations
+    # Clean up
     kernel = np.ones((5, 5), np.uint8)
     cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_OPEN, kernel)
     cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_CLOSE, kernel)
     
-    # Find cyan regions
     contours, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     trailing = False
@@ -1547,7 +1479,6 @@ def detect_trailing_car_enhanced(back_frame):
     trailing_lane = None
     trailing_confidence = 0.0
     
-    # Track previous area for motion detection
     with data_lock:
         prev_area = shared_data.get('back_prev_area', 0.0)
     
@@ -1558,44 +1489,35 @@ def detect_trailing_car_enhanced(back_frame):
             
         x, y, w, h = cv2.boundingRect(cnt)
         
-        # Check if too small or too large
         if w < 20 or h < 20 or w > roi_w * 0.8 or h > roi_h * 0.8:
             continue
             
         aspect_ratio = float(w) / h if h > 0 else 0.0
         height_ratio = float(h) / roi_h
         
-        # Check if this looks like a car (aspect ratio and height)
-        if (0.3 <= aspect_ratio <= 3.0 and height_ratio > 0.08 and height_ratio < 0.85):
+        if (TRAILING_ASPECT_RATIO_MIN <= aspect_ratio <= TRAILING_ASPECT_RATIO_MAX and 
+            height_ratio > TRAILING_MIN_HEIGHT_RATIO and height_ratio < 0.85):
             
-            # Check color purity (how much of the region is cyan)
             roi_region = roi[y:y+h, x:x+w]
             if roi_region.size > 0 and roi_region.shape[0] > 10 and roi_region.shape[1] > 10:
                 hsv_region = cv2.cvtColor(roi_region, cv2.COLOR_BGR2HSV)
-                
-                # Count cyan pixels in region
-                cyan_pixels = 0
-                for lower, upper in cyan_ranges:
-                    mask = cv2.inRange(hsv_region, lower, upper)
-                    cyan_pixels += cv2.countNonZero(mask)
+                cyan_pixels = cv2.countNonZero(cv2.inRange(hsv_region, TRAILING_CYAN_LOWER1, TRAILING_CYAN_UPPER1))
+                cyan_pixels += cv2.countNonZero(cv2.inRange(hsv_region, TRAILING_CYAN_LOWER2, TRAILING_CYAN_UPPER2))
                 
                 region_area = roi_region.shape[0] * roi_region.shape[1]
                 color_purity = cyan_pixels / region_area if region_area > 0 else 0
                 
-                # Require at least 30% cyan purity
                 if color_purity < 0.30:
                     continue
                 
-                # Calculate confidence based on area, color purity, and motion
+                # Confidence based on area and color purity
                 area_confidence = min(1.0, area / TRAILING_MOTION_AREA_MIN)
                 purity_confidence = min(1.0, color_purity * 2.0)
                 confidence = (area_confidence * 0.4 + purity_confidence * 0.6)
                 
-                # Check for motion (approach)
-                motion_detected = False
+                # Motion detection
                 if prev_area > 0 and area > (prev_area * 1.05):
-                    motion_detected = True
-                    confidence = min(1.0, confidence * 1.2)  # Boost confidence if moving
+                    confidence = min(1.0, confidence * 1.2)
                 
                 if area > largest_area and confidence >= 0.5:
                     largest_area = area
@@ -1605,295 +1527,17 @@ def detect_trailing_car_enhanced(back_frame):
                     largest_bbox = (x + roi_x1, y + roi_y1, w, h)
                     trailing_confidence = confidence
                     
-                    # If motion detected and confidence is good, mark as trailing
-                    if motion_detected and confidence >= 0.6:
+                    if confidence >= 0.6:
                         trailing = True
-                        print(f"[TRAILING] Car detected in lane {trailing_lane}! Area: {area:.0f} Conf: {confidence:.2f}")
-                    elif confidence >= 0.7:  # Even without motion, high confidence
-                        trailing = True
-                        print(f"[TRAILING] Car detected in lane {trailing_lane}! Area: {area:.0f} Conf: {confidence:.2f}")
     
-    # Update previous area for motion tracking
     with data_lock:
         if largest_area > 0:
             shared_data['back_prev_area'] = largest_area
-        else:
-            shared_data['back_prev_area'] = 0.0
     
-    # Only return true if we have a valid detection
     if trailing and trailing_confidence >= 0.5 and largest_bbox is not None:
         return True, largest_area, largest_bbox, trailing_lane
     
     return False, largest_area, largest_bbox, trailing_lane
-
-# =========================================================
-# FRONT POLICE CAR DETECTION - For front-facing threats
-# =========================================================
-def detect_police_car_front(front_frame):
-    """
-    Detect police car in front camera view with strict validation.
-    Police car = split red/blue color scheme on a vehicle in front.
-    """
-    if front_frame is None:
-        return False, 0.0, None, None, None
-
-    frame_h, frame_w = front_frame.shape[:2]
-    
-    # Focus on the area where cars would appear in front
-    roi_x1 = int(frame_w * 0.10)
-    roi_x2 = int(frame_w * 0.90)
-    roi_y1 = int(frame_h * 0.10)
-    roi_y2 = int(frame_h * 0.85)
-
-    roi = front_frame[roi_y1:roi_y2, roi_x1:roi_x2]
-    roi_h, roi_w = roi.shape[:2]
-    
-    if roi_h < 50 or roi_w < 50:
-        return False, 0.0, None, None, None
-    
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    
-    # Red masks - more restrictive
-    red_mask1 = cv2.inRange(hsv_roi, POLICE_RED_LOWER1, POLICE_RED_UPPER1)
-    red_mask2 = cv2.inRange(hsv_roi, POLICE_RED_LOWER2, POLICE_RED_UPPER2)
-    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-    
-    # Blue mask - more restrictive
-    blue_mask = cv2.inRange(hsv_roi, POLICE_BLUE_LOWER, POLICE_BLUE_UPPER)
-    
-    # Morphological operations
-    kernel = np.ones((3, 3), np.uint8)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
-    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
-    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
-    
-    # Count total red and blue pixels
-    total_red_pixels = cv2.countNonZero(red_mask)
-    total_blue_pixels = cv2.countNonZero(blue_mask)
-    
-    # Require significant number of both colors
-    if total_red_pixels < 400 or total_blue_pixels < 400:
-        return False, 0.0, None, None, None
-    
-    # Find red regions
-    red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    red_regions = []
-    for cnt in red_contours:
-        area = cv2.contourArea(cnt)
-        if area > 200:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if 0.3 <= w / max(1, h) <= 4.0:
-                red_regions.append((x, y, w, h, area))
-    
-    # Find blue regions
-    blue_contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    blue_regions = []
-    for cnt in blue_contours:
-        area = cv2.contourArea(cnt)
-        if area > 200:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if 0.3 <= w / max(1, h) <= 4.0:
-                blue_regions.append((x, y, w, h, area))
-    
-    if len(red_regions) < 1 or len(blue_regions) < 1:
-        return False, 0.0, None, None, None
-    
-    # Find red and blue regions close to each other
-    best_confidence = 0.0
-    best_bbox = None
-    police_lane = None
-    distance_estimate = None
-    
-    for rx, ry, rw, rh, rarea in red_regions:
-        for bx, by, bw, bh, barea in blue_regions:
-            # Check if regions are close
-            center_red_x = rx + rw/2
-            center_red_y = ry + rh/2
-            center_blue_x = bx + bw/2
-            center_blue_y = by + bh/2
-            
-            dist = np.sqrt((center_red_x - center_blue_x)**2 + (center_red_y - center_blue_y)**2)
-            if dist > 250:
-                continue
-            
-            x1 = min(rx, bx)
-            y1 = min(ry, by)
-            x2 = max(rx + rw, bx + bw)
-            y2 = max(ry + rh, by + bh)
-            
-            combined_w = x2 - x1
-            combined_h = y2 - y1
-            combined_area = combined_w * combined_h
-            
-            if combined_area < POLICE_MIN_AREA or combined_area > POLICE_MAX_AREA:
-                continue
-            
-            aspect_ratio = float(combined_w) / combined_h if combined_h > 0 else 0
-            if aspect_ratio < 0.4 or aspect_ratio > 3.5:
-                continue
-            
-            combined_roi = roi[y1:y2, x1:x2]
-            if combined_roi.size == 0 or combined_roi.shape[0] < 20 or combined_roi.shape[1] < 20:
-                continue
-            
-            hsv_combined = cv2.cvtColor(combined_roi, cv2.COLOR_BGR2HSV)
-            red_combined = cv2.bitwise_or(
-                cv2.inRange(hsv_combined, POLICE_RED_LOWER1, POLICE_RED_UPPER1),
-                cv2.inRange(hsv_combined, POLICE_RED_LOWER2, POLICE_RED_UPPER2)
-            )
-            blue_combined = cv2.inRange(hsv_combined, POLICE_BLUE_LOWER, POLICE_BLUE_UPPER)
-            
-            red_pixels = cv2.countNonZero(red_combined)
-            blue_pixels = cv2.countNonZero(blue_combined)
-            total_pixels = combined_roi.shape[0] * combined_roi.shape[1]
-            
-            if total_pixels == 0:
-                continue
-            
-            red_ratio = red_pixels / total_pixels
-            blue_ratio = blue_pixels / total_pixels
-            
-            if red_ratio < 0.08 or blue_ratio < 0.08:
-                continue
-            
-            split_ratio = red_pixels / (red_pixels + blue_pixels) if (red_pixels + blue_pixels) > 0 else 0.5
-            
-            if split_ratio < 0.25 or split_ratio > 0.75:
-                continue
-            
-            # Calculate confidence
-            confidence = 0.0
-            color_presence = min(1.0, (red_pixels / 400 + blue_pixels / 400) / 2.0)
-            confidence += color_presence * 0.40
-            balance = 1.0 - abs(split_ratio - 0.5) * 2.0
-            confidence += balance * 0.30
-            area_factor = min(1.0, combined_area / 6000.0)
-            confidence += area_factor * 0.30
-            
-            if confidence > best_confidence and confidence >= 0.65:
-                best_confidence = confidence
-                center_x = x1 + combined_w/2
-                center_y = y1 + combined_h/2
-                police_lane = lane_from_x(center_x + roi_x1, center_y + roi_y1, frame_width=frame_w, frame_height=frame_h)
-                best_bbox = (x1 + roi_x1, y1 + roi_y1, combined_w, combined_h)
-                
-                # Estimate distance
-                distance_estimate = (frame_h - (center_y + roi_y1)) / float(frame_h)
-    
-    # Verify detection
-    if best_confidence >= 0.65 and best_bbox is not None:
-        x, y, w, h = best_bbox
-        x = max(0, x - roi_x1)
-        y = max(0, y - roi_y1)
-        verify_roi = roi[y:y+h, x:x+w]
-        if verify_roi.size > 0 and verify_roi.shape[0] > 10 and verify_roi.shape[1] > 10:
-            hsv_verify = cv2.cvtColor(verify_roi, cv2.COLOR_BGR2HSV)
-            red_verify = cv2.bitwise_or(
-                cv2.inRange(hsv_verify, POLICE_RED_LOWER1, POLICE_RED_UPPER1),
-                cv2.inRange(hsv_verify, POLICE_RED_LOWER2, POLICE_RED_UPPER2)
-            )
-            blue_verify = cv2.inRange(hsv_verify, POLICE_BLUE_LOWER, POLICE_BLUE_UPPER)
-            red_pixels = cv2.countNonZero(red_verify)
-            blue_pixels = cv2.countNonZero(blue_verify)
-            
-            if red_pixels >= 200 and blue_pixels >= 200:
-                return True, best_confidence, best_bbox, police_lane, distance_estimate
-    
-    return False, best_confidence, None, None, None
-
-# =========================================================
-# FRONT TRAILING/CHASING CAR DETECTION
-# =========================================================
-def detect_chasing_car_front(front_frame):
-    """
-    Detect chasing car in front camera view (the trailing car that appears in front).
-    """
-    if front_frame is None:
-        return False, 0.0, None, None, None
-
-    frame_h, frame_w = front_frame.shape[:2]
-    
-    roi_x1 = int(frame_w * 0.10)
-    roi_x2 = int(frame_w * 0.90)
-    roi_y1 = int(frame_h * 0.05)
-    roi_y2 = int(frame_h * 0.75)
-
-    roi = front_frame[roi_y1:roi_y2, roi_x1:roi_x2]
-    roi_h, roi_w = roi.shape[:2]
-    
-    if roi_h < 50 or roi_w < 50:
-        return False, 0.0, None, None, None
-    
-    # Multiple cyan/teal ranges
-    cyan_ranges = [
-        (np.array([80, 70, 70]), np.array([110, 255, 255])),
-        (np.array([75, 60, 100]), np.array([105, 255, 255])),
-        (np.array([85, 80, 60]), np.array([110, 255, 200])),
-    ]
-    
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    
-    # Combine multiple cyan masks
-    cyan_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
-    for lower, upper in cyan_ranges:
-        mask = cv2.inRange(hsv_roi, lower, upper)
-        cyan_mask = cv2.bitwise_or(cyan_mask, mask)
-    
-    cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    
-    contours, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    largest_area = 0.0
-    largest_bbox = None
-    chasing_lane = None
-    chasing_confidence = 0.0
-    
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < TRAILING_MOTION_AREA_MIN * 0.5:
-            continue
-            
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w < 20 or h < 20 or w > roi_w * 0.8 or h > roi_h * 0.8:
-            continue
-            
-        aspect_ratio = float(w) / h if h > 0 else 0.0
-        height_ratio = float(h) / roi_h
-        
-        if (0.3 <= aspect_ratio <= 3.0 and height_ratio > 0.08 and height_ratio < 0.85):
-            
-            roi_region = roi[y:y+h, x:x+w]
-            if roi_region.size > 0 and roi_region.shape[0] > 10 and roi_region.shape[1] > 10:
-                hsv_region = cv2.cvtColor(roi_region, cv2.COLOR_BGR2HSV)
-                
-                cyan_pixels = 0
-                for lower, upper in cyan_ranges:
-                    mask = cv2.inRange(hsv_region, lower, upper)
-                    cyan_pixels += cv2.countNonZero(mask)
-                
-                region_area = roi_region.shape[0] * roi_region.shape[1]
-                color_purity = cyan_pixels / region_area if region_area > 0 else 0
-                
-                if color_purity < 0.30:
-                    continue
-                
-                confidence = min(1.0, (area / (TRAILING_MOTION_AREA_MIN * 0.5)) * 0.4 + color_purity * 0.6)
-                
-                if area > largest_area and confidence >= 0.5:
-                    largest_area = area
-                    center_x = x + w/2
-                    center_y = y + h/2
-                    chasing_lane = lane_from_x(center_x + roi_x1, center_y + roi_y1, frame_width=frame_w, frame_height=frame_h)
-                    largest_bbox = (x + roi_x1, y + roi_y1, w, h)
-                    chasing_confidence = confidence
-    
-    if largest_area > 0 and chasing_confidence >= 0.5 and largest_bbox is not None:
-        print(f"[FRONT CHASING] Chasing car detected in lane {chasing_lane}! Confidence: {chasing_confidence:.2f}")
-        return True, chasing_confidence, largest_bbox, chasing_lane, None
-    
-    return False, 0.0, None, None, None
 
 def get_active_yellow_effect():
     now = time.time()
@@ -2247,17 +1891,16 @@ def processing_task():
             # DETECT FRONT THREATS - POLICE AND CHASING CARS
             # =========================================================
             # Detect police car in front
-            police_front, police_front_conf, police_front_bbox, police_front_lane, police_front_dist = detect_police_car_front(front_frame)
+            police_front, police_front_conf, police_front_bbox, police_front_lane = detect_police_car(front_frame)
             
             # Detect chasing/trailing car in front
-            chasing_front, chasing_front_conf, chasing_front_bbox, chasing_front_lane, _ = detect_chasing_car_front(front_frame)
+            chasing_front, chasing_front_conf, chasing_front_bbox, chasing_front_lane = detect_trailing_car(front_frame)
             
             with data_lock:
                 # Store front detections
-                shared_data['police_front_detected'] = police_front and police_front_conf >= 0.65
+                shared_data['police_front_detected'] = police_front and police_front_conf >= 0.60
                 shared_data['police_front_lane'] = police_front_lane
                 shared_data['police_front_confidence'] = police_front_conf
-                shared_data['police_front_distance'] = police_front_dist
                 shared_data['police_front_bbox'] = police_front_bbox
                 
                 shared_data['chasing_front_detected'] = chasing_front
@@ -2267,11 +1910,10 @@ def processing_task():
                 
                 # EV2: Police car detection - require consistent detection
                 police_history = shared_data.get('police_detection_history', [])
-                if police_front and police_front_conf >= 0.65:
+                if police_front and police_front_conf >= 0.60:
                     police_history.append(1)
                     if len(police_history) > 5:
                         police_history.pop(0)
-                    # Require at least 3 out of 5 frames to have police car
                     if sum(police_history) >= 3:
                         if not shared_data.get('ev2_police_active', False):
                             shared_data['ev2_police_active'] = True
@@ -2279,46 +1921,40 @@ def processing_task():
                             shared_data['ev2_red_token_collected'] = False
                             shared_data['ev2_police_penalty'] = False
                             print(f"[EV2] 🚨 POLICE CAR CONFIRMED! Collect red token within 5 seconds!")
-                            print(f"[EV2] !!! Hitting police car = GAME OVER !!!")
                 else:
                     police_history.append(0)
                     if len(police_history) > 5:
                         police_history.pop(0)
                 shared_data['police_detection_history'] = police_history
                 
-                # EV3 & EV4: Chasing car detection - require consistent detection
+                # EV3 & EV4: Chasing car detection
                 if chasing_front and chasing_front_conf >= 0.5:
                     trailing_streak = shared_data.get('trailing_streak', 0) + 1
                     shared_data['trailing_streak'] = trailing_streak
                     shared_data['trailing_lane'] = chasing_front_lane
                     
-                    # Require at least 3 consecutive frames
                     if trailing_streak >= 3:
                         shared_data['trailing_detected'] = True
                         shared_data['danger_detected'] = True
                         
-                        # EV3: First chasing car
                         if not shared_data.get('ev3_chasing1_active', False) and not shared_data.get('ev4_chasing2_active', False):
                             shared_data['ev3_chasing1_active'] = True
                             shared_data['ev3_chasing1_start_time'] = time.time()
                             shared_data['ev3_chasing1_evaded'] = False
                             print(f"[EV3] 🏎️ CHASING CAR 1 DETECTED! (10 sec to avoid)")
-                        
-                        # EV4: Second chasing car
                         elif shared_data.get('ev3_chasing1_active', False) and not shared_data.get('ev4_chasing2_active', False):
                             shared_data['ev4_chasing2_active'] = True
                             shared_data['ev4_chasing2_start_time'] = time.time()
                             shared_data['ev4_chasing2_evaded'] = False
                             print(f"[EV4] 🏎️ CHASING CAR 2 DETECTED! (3 sec to avoid)")
                 else:
-                    # Decrease streak if no detection
                     trailing_streak = max(0, shared_data.get('trailing_streak', 0) - 1)
                     shared_data['trailing_streak'] = trailing_streak
                     if trailing_streak < 3:
                         shared_data['trailing_detected'] = False
             
             # If police car detected in front and in same lane, EVADE IMMEDIATELY!
-            if police_front and police_front_conf >= 0.65 and police_front_lane == current_lane:
+            if police_front and police_front_conf >= 0.60 and police_front_lane == current_lane:
                 print(f"[EV2] ⚠️ Police car in lane {police_front_lane}! EVADING IMMEDIATELY!")
                 with data_lock:
                     shared_data['front_police_evade'] = True
@@ -2332,7 +1968,9 @@ def processing_task():
                     shared_data['front_chasing_evade'] = True
                     shared_data['front_chasing_evade_until'] = time.time() + 2.0
             
-            # SUPER FAST LIGHT DETECTION - Check brightness every frame
+            # =========================================================
+            # SUPER FAST LIGHT DETECTION & RECOVERY - ENHANCED
+            # =========================================================
             try:
                 gray_full = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
                 current_brightness = float(np.mean(gray_full))
@@ -2340,68 +1978,87 @@ def processing_task():
                 with data_lock:
                     baseline = shared_data.get('brightness_baseline')
                     low_light_active = shared_data.get('low_light_active', False)
+                    light_confirm_count = shared_data.get('light_confirm_count', 0)
+                    recovery_confirm_count = shared_data.get('recovery_confirm_count', 0)
                     
-                    if baseline is None:
-                        baseline = current_brightness
+                    # Initialize baseline
+                    if baseline is None or baseline < 10.0:
+                        baseline = max(current_brightness, 50.0)
                         shared_data['brightness_baseline'] = baseline
                         print(f"[LIGHT] Baseline brightness set to: {baseline:.1f}")
                     
+                    # Check for split screen (not low light)
                     std_dev = np.std(gray_full)
                     is_split_screen = std_dev > 80
                     
+                    # Determine if dark
                     is_dark = False
                     if not is_split_screen and baseline >= LOWLIGHT_MIN_BASELINE:
                         if current_brightness < baseline * LOWLIGHT_DARK_THRESHOLD:
                             is_dark = True
                             if not low_light_active:
-                                print(f"[LIGHT] ⚡ DARKNESS DETECTED! Brightness: {current_brightness:.1f}")
+                                print(f"[LIGHT] ⚡ DARKNESS DETECTED! Brightness: {current_brightness:.1f} (baseline: {baseline:.1f})")
                                 shared_data['recovery_phase'] = 1
-                                # EV1: Darkness detected - must brake fully
-                                shared_data['ev1_darkness_active'] = True
-                                shared_data['ev1_darkness_brake_sent'] = False
-                                print(f"[EV1] 🌑 DARKNESS EVENT! Must brake/decelerate fully!")
                         elif low_light_active and current_brightness < baseline * LOWLIGHT_RECOVERY_THRESHOLD:
                             is_dark = True
                     
+                    # Handle darkness detection with confirmation
                     if is_dark and not low_light_active:
-                        shared_data['low_light_active'] = True
-                        shared_data['low_light_recovery_sent'] = False
-                        shared_data['low_light_recovery_start_time'] = time.time()
-                        shared_data['recovery_attempts'] = 0
-                        shared_data['recovery_completed'] = False
-                        print(f"[LIGHT] 🔦 LOW LIGHT ACTIVE! Sending fast recovery...")
+                        light_confirm_count += 1
+                        if light_confirm_count >= LOWLIGHT_CONFIRM_FRAMES:
+                            shared_data['low_light_active'] = True
+                            shared_data['low_light_recovery_sent'] = False
+                            shared_data['low_light_recovery_start_time'] = time.time()
+                            shared_data['recovery_attempts'] = 0
+                            shared_data['recovery_completed'] = False
+                            shared_data['ev1_darkness_active'] = True
+                            shared_data['ev1_darkness_brake_sent'] = False
+                            print(f"[EV1] 🌑 DARKNESS CONFIRMED! Must brake/decelerate fully!")
+                            light_confirm_count = 0
                     elif not is_dark and low_light_active:
-                        shared_data['low_light_active'] = False
-                        shared_data['low_light_recovered'] = True
-                        shared_data['lights_on'] = True
-                        shared_data['low_light_recovery_sent'] = False
-                        shared_data['recovery_completed'] = True
-                        shared_data['recovery_phase'] = 0
-                        shared_data['run_summary']['light_recovered'] = True
-                        shared_data['ev1_darkness_active'] = False
-                        print(f"[LIGHT] ✅ LIGHT RESTORED! Brightness: {current_brightness:.1f}")
-                        print(f"[EV1] ✅ Darkness event resolved!")
+                        recovery_confirm_count += 1
+                        if recovery_confirm_count >= LOWLIGHT_RECOVERY_FRAMES:
+                            shared_data['low_light_active'] = False
+                            shared_data['low_light_recovered'] = True
+                            shared_data['lights_on'] = True
+                            shared_data['low_light_recovery_sent'] = False
+                            shared_data['recovery_completed'] = True
+                            shared_data['recovery_phase'] = 0
+                            shared_data['run_summary']['light_recovered'] = True
+                            shared_data['ev1_darkness_active'] = False
+                            recovery_confirm_count = 0
+                            print(f"[LIGHT] ✅ LIGHT RESTORED! Brightness: {current_brightness:.1f}")
+                            print(f"[EV1] ✅ Darkness event resolved!")
+                    else:
+                        # Reset confirm counts if conditions change
+                        if is_dark:
+                            light_confirm_count = min(light_confirm_count + 1, LOWLIGHT_CONFIRM_FRAMES)
+                            recovery_confirm_count = 0
+                        else:
+                            recovery_confirm_count = min(recovery_confirm_count + 1, LOWLIGHT_RECOVERY_FRAMES)
+                            light_confirm_count = 0
                     
+                    # Update baseline with adaptive learning
                     if not low_light_active:
-                        baseline = baseline * 0.97 + current_brightness * 0.03
+                        baseline = baseline * 0.95 + current_brightness * 0.05
                     else:
                         baseline = baseline * 0.99 + current_brightness * 0.01
-                    shared_data['brightness_baseline'] = baseline
                     
+                    shared_data['brightness_baseline'] = max(baseline, 30.0)
                     shared_data['brightness_last'] = current_brightness
                     shared_data['lights_on'] = not low_light_active
+                    shared_data['light_confirm_count'] = light_confirm_count
+                    shared_data['recovery_confirm_count'] = recovery_confirm_count
                     
+                    # Track event timing - Challenge 1: Light event must happen within first 10 seconds
                     elapsed = time.time() - run_start_time if run_start_time else 999.0
                     if low_light_active and elapsed <= LOWLIGHT_EVENT_WINDOW_SECONDS:
                         if not shared_data.get('light_event_triggered', False):
                             shared_data['light_event_triggered'] = True
-                            print(f"[LIGHT] Light event triggered at {elapsed:.2f}s")
-                    
-                    if low_light_active and shared_data.get('low_light_recovery_sent', False):
-                        time_since_recovery = time.time() - shared_data.get('last_recovery_time', 0)
-                        if time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
-                            shared_data['recovery_phase'] = 1
+                            print(f"[LIGHT] 🌑 CHALLENGE 1: Light event triggered at {elapsed:.2f}s")
+                            print(f"[LIGHT] ⚡ Send acceleration_input = -1.0 to recover light!")
                 
+                # Update tokens for low light - All tokens become Yellow
                 if low_light_active:
                     for token in tokens:
                         token['original_color'] = token.get('true_color', token.get('color'))
@@ -2437,7 +2094,7 @@ def processing_task():
                 debug_frame = processed_front_frame.copy()
             
             # Draw front detections on debug frame
-            if police_front and police_front_conf >= 0.65 and police_front_bbox is not None:
+            if police_front and police_front_conf >= 0.60 and police_front_bbox is not None:
                 x, y, w, h = police_front_bbox
                 cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (0, 0, 255), 3)
                 cv2.putText(debug_frame, f"POLICE FRONT ({police_front_lane})", (x, y-10),
@@ -2483,13 +2140,6 @@ def processing_task():
                     remaining = max(0, 3.0 - elapsed)
                     cv2.putText(debug_frame, f"🏎️ EV4: CHASING CAR 2 - {remaining:.1f}s to evade", (10, 200),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-                
-                ev5_active = shared_data.get('ev5_golden_lane_active', False)
-                if ev5_active:
-                    elapsed = time.time() - shared_data.get('ev5_golden_lane_start_time', 0)
-                    remaining = max(0, 5.0 - elapsed)
-                    cv2.putText(debug_frame, f"🌟 EV5: GOLDEN LANE - {remaining:.1f}s to be in lane {shared_data.get('ev5_golden_lane_target', 0)}", (10, 220),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
             
             effect = get_active_yellow_effect()
             if effect:
@@ -2521,15 +2171,9 @@ def processing_task():
                 back_debug = dict(shared_data.get('back_detection_debug', {}))
 
             if now - last_back_detection_time >= BACK_DETECTION_INTERVAL_SECONDS:
-                vehicles = []
-                
-                # Use improved police detection
-                police_raw, police_confidence, police_bbox, police_lane = detect_police_car_accurate(back_frame)
-                
-                # Use improved trailing detection
-                trailing_raw, trailing_area, trailing_bbox, trailing_lane = detect_trailing_car_enhanced(back_frame)
-                
-                detection_source = "HSV"
+                # Use unified detection functions
+                police_raw, police_confidence, police_bbox, police_lane = detect_police_car(back_frame)
+                trailing_raw, trailing_area, trailing_bbox, trailing_lane = detect_trailing_car(back_frame)
                 
                 back_debug = {
                     'trailing_raw': trailing_raw,
@@ -2540,29 +2184,26 @@ def processing_task():
                     'police_confidence': police_confidence,
                     'police_bbox': police_bbox,
                     'police_lane': police_lane,
-                    'vehicles': vehicles,
-                    'detection_source': detection_source
                 }
 
                 with data_lock:
                     shared_data['last_back_detection_time'] = now
                     shared_data['back_detection_debug'] = back_debug
 
-                    # Update trailing detection with frame confirmation
+                    # Update trailing detection
                     if trailing_raw:
                         shared_data['trailing_streak'] = shared_data.get('trailing_streak', 0) + 1
                         shared_data['trailing_lane'] = trailing_lane
                     else:
                         shared_data['trailing_streak'] = 0
                     
-                    # Update police detection with frame confirmation
+                    # Update police detection
                     police_history = shared_data.get('police_detection_history', [])
                     police_history.append(1 if police_raw else 0)
                     if len(police_history) > POLICE_CONFIRM_FRAMES:
                         police_history.pop(0)
                     shared_data['police_detection_history'] = police_history
                     
-                    # Require consecutive detections for confirmation
                     police_confirmed = sum(police_history) >= (POLICE_CONFIRM_FRAMES * 0.7)
                     trailing_confirmed = shared_data['trailing_streak'] >= TRAILING_CONFIRM_FRAMES
                     
@@ -2582,7 +2223,6 @@ def processing_task():
                             shared_data['ev2_red_token_collected'] = False
                             shared_data['ev2_police_penalty'] = False
                             print(f"[EV2] 🚨 POLICE CAR CONFIRMED! Collect red token within 5 seconds!")
-                            print(f"[EV2] !!! Hitting police car = GAME OVER !!!")
                     
                     if trailing_confirmed:
                         shared_data['run_summary']['trailing_appeared'] = True
@@ -2606,10 +2246,8 @@ def processing_task():
             police_confidence = back_debug.get('police_confidence', 0.0)
             police_bbox = back_debug.get('police_bbox')
             police_lane = back_debug.get('police_lane')
-            vehicles = back_debug.get('vehicles', [])
-            detection_source = back_debug.get('detection_source', 'HSV')
 
-            # Check EV2 police time limit and apply penalties
+            # Check EV2 police time limit
             with data_lock:
                 if shared_data.get('ev2_police_active', False):
                     police_elapsed = time.time() - shared_data.get('ev2_police_start_time', 0)
@@ -2621,7 +2259,7 @@ def processing_task():
                                 shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
                         shared_data['ev2_police_active'] = False
                 
-                # Check EV3 chasing car 1 time limit
+                # Check EV3 time limit
                 if shared_data.get('ev3_chasing1_active', False):
                     ev3_elapsed = time.time() - shared_data.get('ev3_chasing1_start_time', 0)
                     if ev3_elapsed > 10.0:
@@ -2632,7 +2270,7 @@ def processing_task():
                                 shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
                         shared_data['ev3_chasing1_active'] = False
                 
-                # Check EV4 chasing car 2 time limit
+                # Check EV4 time limit
                 if shared_data.get('ev4_chasing2_active', False):
                     ev4_elapsed = time.time() - shared_data.get('ev4_chasing2_start_time', 0)
                     if ev4_elapsed > 3.0:
@@ -2645,7 +2283,7 @@ def processing_task():
 
             if not SHOW_BACK_DEBUG:
                 dbg = cv2.resize(back_frame.copy(), (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-                cv2.putText(dbg, f"Back HSV T:{trailing_raw} P:{police_raw}", (10, 28),
+                cv2.putText(dbg, f"Back T:{trailing_raw} P:{police_raw}", (10, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
                 with data_lock:
                     shared_data['display_back_frame'] = dbg.copy()
@@ -2656,20 +2294,6 @@ def processing_task():
             scale_x = DISPLAY_WIDTH / back_frame.shape[1]
             scale_y = DISPLAY_HEIGHT / back_frame.shape[0]
 
-            if vehicles:
-                scaled_vehicles = []
-                for vehicle in vehicles:
-                    scaled_vehicle = dict(vehicle)
-                    x, y, w, h = vehicle['bbox']
-                    scaled_vehicle['bbox'] = (
-                        int(x * scale_x),
-                        int(y * scale_y),
-                        int(w * scale_x),
-                        int(h * scale_y)
-                    )
-                    scaled_vehicles.append(scaled_vehicle)
-                dbg = draw_yolo_vehicle_overlay(dbg, scaled_vehicles)
-            
             if trailing_bbox is not None and trailing_raw:
                 x, y, w, h = trailing_bbox
                 cv2.rectangle(
@@ -2680,7 +2304,7 @@ def processing_task():
                 cv2.putText(dbg, f"TRAILING CAR (Lane {trailing_lane})", (int(x * scale_x), int(y * scale_y) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-            if police_bbox is not None and police_raw and police_confidence >= 0.65:
+            if police_bbox is not None and police_raw and police_confidence >= 0.60:
                 x, y, w, h = police_bbox
                 cv2.rectangle(
                     dbg,
@@ -2693,12 +2317,11 @@ def processing_task():
             status_color = (0, 255, 0)
             if trailing_raw:
                 status_color = (0, 255, 255)
-            if police_raw and police_confidence >= 0.65:
+            if police_raw and police_confidence >= 0.60:
                 status_color = (0, 0, 255)
 
             lines = [
                 "Back Camera",
-                f"Detector: {detection_source} Vehicles: {len(vehicles)}",
                 f"Trailing: {trailing_raw} (conf: {shared_data['trailing_streak']}) Lane: {trailing_lane}",
                 f"Police: {police_raw} (conf: {police_confidence:.2f}) Lane: {police_lane}",
                 f"Area: {int(trailing_area)}"
@@ -2766,8 +2389,6 @@ def send_controls_task():
     desired_lane = current_lane
     decision_reason = "MAINTAIN"
     target_debug = "green:none"
-    center_green_steer = None
-    green_direct_steer = None
     selected_green_target = None
     predicted_green_x = None
     selected_target_type = "NONE"
@@ -2801,11 +2422,11 @@ def send_controls_task():
     
     # =========================================================
     # EV1: DARKNESS - HIGHEST PRIORITY - Brake fully!
+    # Challenge 1: Low Light - Send acceleration_input = -1.0
     # =========================================================
     if ev1_darkness_active:
-        print(f"[EV1] 🌑 DARKNESS ACTIVE - Braking fully!")
         steering_input = 0.0
-        acceleration_input = -1.0  # Full brake
+        acceleration_input = -1.0  # Full brake as required by Challenge 1
         decision_reason = "EV1_DARKNESS"
         selected_target_type = "EV1_DARKNESS"
         with data_lock:
@@ -2823,42 +2444,120 @@ def send_controls_task():
         return
 
     # =========================================================
+    # SUPER FAST LIGHT RECOVERY - ENHANCED
+    # Challenge 1: Send acceleration_input = -1.0 to recover light
+    # =========================================================
+    if low_light_active and not ev1_darkness_active:
+        with data_lock:
+            recovery_sent = shared_data.get('low_light_recovery_sent', False)
+            last_recovery_time = shared_data.get('last_recovery_time', 0.0)
+            recovery_attempts = shared_data.get('recovery_attempts', 0)
+            current_brightness = shared_data.get('brightness_last', 0.0)
+            baseline = shared_data.get('brightness_baseline', current_brightness)
+        
+        # Check if light is restored
+        if current_brightness > baseline * LOWLIGHT_RECOVERY_THRESHOLD:
+            with data_lock:
+                shared_data['low_light_active'] = False
+                shared_data['lights_on'] = True
+                shared_data['low_light_recovery_sent'] = False
+                shared_data['recovery_completed'] = True
+                shared_data['recovery_phase'] = 0
+                shared_data['run_summary']['light_recovered'] = True
+                shared_data['ev1_darkness_active'] = False
+            print(f"[LIGHT] ✅ LIGHT RESTORED! Brightness: {current_brightness:.1f}")
+            print(f"[EV1] ✅ Darkness event resolved!")
+            return
+        
+        time_since_recovery = time.time() - last_recovery_time
+        
+        # Send recovery burst - FAST!
+        if not recovery_sent or time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
+            steering_input = 0.0
+            acceleration_input = -1.0  # Challenge 1: Send acceleration_input = -1.0
+            
+            with data_lock:
+                shared_data['low_light_recovery_sent'] = True
+                shared_data['last_recovery_time'] = time.time()
+                shared_data['recovery_attempts'] = recovery_attempts + 1
+                shared_data['run_summary']['light_recovery_attempts'] = shared_data['run_summary'].get('light_recovery_attempts', 0) + 1
+                shared_data['steering_input'] = steering_input
+                shared_data['acceleration_input'] = acceleration_input
+                shared_data['speed_modifier'] = speed_modifier
+                shared_data['selected_target_type'] = 'LOW_LIGHT'
+                shared_data['current_mode'] = 'LOW_LIGHT'
+                shared_data['ev1_darkness_active'] = True
+            
+            print(f"[LIGHT] ⚡ FAST RECOVERY BURST (attempt {recovery_attempts + 1})")
+            print(f"[LIGHT] Sending acceleration_input = -1.0 to recover light!")
+            
+            # Send multiple recovery packets in quick succession
+            for i in range(LOWLIGHT_FAST_RECOVERY_COUNT):
+                try:
+                    send_control_packet(0.0, -1.0)
+                    time.sleep(0.02)  # Very fast between packets
+                except Exception:
+                    pass
+            
+            # Send an extra burst for good measure
+            time.sleep(0.02)
+            for i in range(3):
+                try:
+                    send_control_packet(0.0, -1.0)
+                    time.sleep(0.01)
+                except Exception:
+                    pass
+            
+            print(f"[LIGHT] ✅ Recovery burst sent! Waiting for light to restore...")
+            return
+        
+        # Continue sending brake signal if still dark
+        steering_input = 0.0
+        acceleration_input = -1.0  # Keep braking until recovered
+        with data_lock:
+            shared_data['steering_input'] = steering_input
+            shared_data['acceleration_input'] = acceleration_input
+            shared_data['speed_modifier'] = speed_modifier
+            shared_data['selected_target_type'] = 'LOW_LIGHT'
+            shared_data['current_mode'] = 'LOW_LIGHT'
+            shared_data['ev1_darkness_active'] = True
+        
+        try:
+            send_control_packet(steering_input, acceleration_input)
+        except Exception as e:
+            print(f"Network error: {e}")
+            control_conn = None
+        return
+
+    # =========================================================
     # EV2: POLICE CAR - MUST collect red token within 5 seconds
     # =========================================================
     if ev2_police_active:
         elapsed = time.time() - ev2_police_start
         remaining = max(0, 5.0 - elapsed)
         
-        # Only print every 0.5 seconds to avoid spam
         if int(elapsed * 2) != int((elapsed - 0.02) * 2):
             print(f"[EV2] 🚨 POLICE ACTIVE! {remaining:.1f}s to collect RED token!")
         
-        # Look for red tokens only in the area ahead
         red_tokens = [t for t in tokens_snapshot if t.get('color') == 'red' and t['y'] >= TOKEN_DECISION_Y_MIN and t['y'] < img_h * 0.9]
         
         if red_tokens:
-            # Find the closest red token
             target_red = max(red_tokens, key=lambda t: (t['y'], -abs(t['x'] - (img_w / 2.0))))
             red_lane = lane_from_x(target_red['x'], target_red['y'], frame_width=img_w, frame_height=img_h)
             
-            # Move towards the red token lane
             desired_lane = red_lane
             decision_reason = "EV2_RED_TOKEN"
             selected_target_type = "RED"
             acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
             
-            # Check if police car is in same lane - EVADE!
             if police_front_detected and police_front_lane == current_lane:
-                print(f"[EV2] ⚠️ Police car in lane! EVADING while seeking red token!")
                 safe_lane = get_safe_lane(current_lane, {current_lane, police_front_lane}, img_w)
                 if safe_lane != current_lane:
                     desired_lane = safe_lane
                     decision_reason = "EV2_POLICE_EVADE"
                     steering_input = apply_tap_steering(safe_lane)
             
-            # If we're close to the red token, collect it
             if target_red['y'] >= img_h * 0.85:
-                print(f"[EV2] ✅ Collecting RED token!")
                 with data_lock:
                     shared_data['ev2_red_token_collected'] = True
                     shared_data['red_token_collected_during_police'] = True
@@ -2867,7 +2566,6 @@ def send_controls_task():
                 decision_reason = "EV2_RED_COLLECTED"
                 selected_target_type = "EV2_COMPLETE"
         else:
-            # No red token visible - just try to avoid police
             if police_front_detected and police_front_lane == current_lane:
                 safe_lane = get_safe_lane(current_lane, {current_lane, police_front_lane}, img_w)
                 if safe_lane != current_lane:
@@ -2875,9 +2573,7 @@ def send_controls_task():
                     decision_reason = "EV2_POLICE_EVADE"
                     steering_input = apply_tap_steering(safe_lane)
         
-        # Check time limit
         if elapsed > 5.0 and not ev2_red_collected:
-            print(f"[EV2] ❌ Time expired! Speed reduced by 50%!")
             with data_lock:
                 if not shared_data.get('ev2_police_penalty', False):
                     shared_data['ev2_police_penalty'] = True
@@ -2896,9 +2592,7 @@ def send_controls_task():
         if int(elapsed * 2) != int((elapsed - 0.02) * 2):
             print(f"[EV3] 🏎️ CHASING CAR 1 ACTIVE! {remaining:.1f}s to evade!")
         
-        # Check if chasing car is in same lane
         if chasing_front_detected and chasing_front_lane == current_lane:
-            print(f"[EV3] ⚠️ Chasing car in lane! EVADING!")
             safe_lane = get_safe_lane(current_lane, {current_lane, chasing_front_lane}, img_w)
             if safe_lane != current_lane:
                 desired_lane = safe_lane
@@ -2908,19 +2602,15 @@ def send_controls_task():
                 with data_lock:
                     shared_data['ev3_chasing1_evaded'] = True
             else:
-                # No safe lane - brake hard
                 acceleration_input = min(acceleration_input, 0.4)
                 decision_reason = "EV3_CHASING_BRAKE"
         else:
-            # Not in same lane - mark as evaded
             with data_lock:
                 if not shared_data.get('ev3_chasing1_evaded', False):
                     shared_data['ev3_chasing1_evaded'] = True
                 shared_data['ev3_chasing1_active'] = False
         
-        # Check time limit
         if elapsed > 10.0 and not shared_data.get('ev3_chasing1_evaded', False):
-            print(f"[EV3] ❌ Time expired! Speed reduced by 50%!")
             with data_lock:
                 if not shared_data.get('trailing_first_penalty_applied', False):
                     shared_data['trailing_first_penalty_applied'] = True
@@ -2939,9 +2629,7 @@ def send_controls_task():
         if int(elapsed * 2) != int((elapsed - 0.02) * 2):
             print(f"[EV4] 🏎️ CHASING CAR 2 ACTIVE! {remaining:.1f}s to evade!")
         
-        # Check if chasing car is in same lane
         if chasing_front_detected and chasing_front_lane == current_lane:
-            print(f"[EV4] ⚠️ Chasing car in lane! EVADING!")
             safe_lane = get_safe_lane(current_lane, {current_lane, chasing_front_lane}, img_w)
             if safe_lane != current_lane:
                 desired_lane = safe_lane
@@ -2951,19 +2639,15 @@ def send_controls_task():
                 with data_lock:
                     shared_data['ev4_chasing2_evaded'] = True
             else:
-                # No safe lane - brake hard
                 acceleration_input = min(acceleration_input, 0.3)
                 decision_reason = "EV4_CHASING_BRAKE"
         else:
-            # Not in same lane - mark as evaded
             with data_lock:
                 if not shared_data.get('ev4_chasing2_evaded', False):
                     shared_data['ev4_chasing2_evaded'] = True
                 shared_data['ev4_chasing2_active'] = False
         
-        # Check time limit
         if elapsed > 3.0 and not shared_data.get('ev4_chasing2_evaded', False):
-            print(f"[EV4] ❌ Time expired! Speed reduced by 50%!")
             with data_lock:
                 if not shared_data.get('trailing_second_penalty_applied', False):
                     shared_data['trailing_second_penalty_applied'] = True
@@ -2984,17 +2668,14 @@ def send_controls_task():
             print(f"[EV5] 🌟 GOLDEN LANE ACTIVE! {remaining:.1f}s to reach lane {target_lane}")
         
         if current_lane != target_lane:
-            print(f"[EV5] 🌟 Moving to golden lane {target_lane}! {remaining:.1f}s remaining")
             desired_lane = target_lane
             decision_reason = "EV5_GOLDEN_LANE"
             selected_target_type = "EV5_GOLDEN"
             steering_input = apply_tap_steering(target_lane)
         else:
-            print(f"[EV5] ✅ In golden lane {target_lane}!")
             with data_lock:
                 shared_data['ev5_golden_lane_active'] = False
         
-        # Check if timer expired
         if elapsed > 5.0:
             if current_lane == target_lane:
                 print(f"[EV5] ✅ Success! Was in golden lane {target_lane} at timer expiry!")
@@ -3004,79 +2685,9 @@ def send_controls_task():
                 shared_data['ev5_golden_lane_active'] = False
 
     # =========================================================
-    # SUPER FAST LIGHT RECOVERY (only if no EV is active)
-    # =========================================================
-    if low_light_active and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active]):
-        with data_lock:
-            recovery_sent = shared_data.get('low_light_recovery_sent', False)
-            last_recovery_time = shared_data.get('last_recovery_time', 0.0)
-            recovery_attempts = shared_data.get('recovery_attempts', 0)
-            current_brightness = shared_data.get('brightness_last', 0.0)
-            baseline = shared_data.get('brightness_baseline', current_brightness)
-        
-        if current_brightness > baseline * LOWLIGHT_RECOVERY_THRESHOLD:
-            print(f"[LIGHT] ✅ Light restored! Brightness: {current_brightness:.1f}")
-            with data_lock:
-                shared_data['low_light_active'] = False
-                shared_data['lights_on'] = True
-                shared_data['low_light_recovery_sent'] = False
-                shared_data['recovery_completed'] = True
-                shared_data['recovery_phase'] = 0
-                shared_data['run_summary']['light_recovered'] = True
-                shared_data['ev1_darkness_active'] = False
-            return
-        
-        time_since_recovery = time.time() - last_recovery_time
-        
-        if not recovery_sent or time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
-            steering_input = 0.0
-            acceleration_input = -1.0
-            
-            with data_lock:
-                shared_data['low_light_recovery_sent'] = True
-                shared_data['last_recovery_time'] = time.time()
-                shared_data['recovery_attempts'] = recovery_attempts + 1
-                shared_data['run_summary']['light_recovery_attempts'] = shared_data['run_summary'].get('light_recovery_attempts', 0) + 1
-                shared_data['steering_input'] = steering_input
-                shared_data['acceleration_input'] = acceleration_input
-                shared_data['speed_modifier'] = speed_modifier
-                shared_data['selected_target_type'] = 'LOW_LIGHT'
-                shared_data['current_mode'] = 'LOW_LIGHT'
-                shared_data['ev1_darkness_active'] = True
-            
-            print(f"[LIGHT] ⚡ FAST RECOVERY (attempt {recovery_attempts + 1})")
-            
-            for i in range(LOWLIGHT_FAST_RECOVERY_COUNT):
-                try:
-                    send_control_packet(0.0, -1.0)
-                    time.sleep(0.03)
-                except Exception:
-                    pass
-            return
-        
-        steering_input = 0.0
-        acceleration_input = apply_speed_rules(MIN_ACCELERATION_WHEN_SLOWED)
-        with data_lock:
-            shared_data['steering_input'] = steering_input
-            shared_data['acceleration_input'] = acceleration_input
-            shared_data['speed_modifier'] = speed_modifier
-            shared_data['selected_target_type'] = 'LOW_LIGHT'
-            shared_data['current_mode'] = 'LOW_LIGHT'
-        
-        try:
-            send_control_packet(steering_input, acceleration_input)
-        except Exception as e:
-            print(f"Network error: {e}")
-            control_conn = None
-        return
-
-    # =========================================================
-    # FRONT POLICE CAR EVASION - HIGH PRIORITY (if not in EV)
+    # FRONT POLICE CAR EVASION (if not in EV)
     # =========================================================
     if (front_police_evade or (police_front_detected and police_front_lane == current_lane)) and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active]):
-        print(f"[FRONT POLICE] 🚨 FRONT POLICE CAR EVASION! Moving out of lane {current_lane}")
-        
-        # Find safe lane (avoid police lane and current lane)
         hazard_lanes = {current_lane}
         if police_front_lane is not None:
             hazard_lanes.add(police_front_lane)
@@ -3089,7 +2700,6 @@ def send_controls_task():
             selected_target_type = "FRONT_POLICE_EVADE"
             acceleration_input = min(acceleration_input, 0.70)
             steering_input = apply_tap_steering(safe_lane)
-            print(f"[FRONT POLICE] Evading to lane {safe_lane}")
             with data_lock:
                 shared_data['target_lane'] = safe_lane
                 shared_data['emergency_evade_lane'] = safe_lane
@@ -3098,14 +2708,11 @@ def send_controls_task():
         else:
             acceleration_input = 0.3
             decision_reason = "FRONT_POLICE_BRAKE"
-            print(f"[FRONT POLICE] No safe lane! Braking hard!")
 
     # =========================================================
-    # FRONT CHASING CAR EVASION - HIGH PRIORITY (if not in EV)
+    # FRONT CHASING CAR EVASION (if not in EV)
     # =========================================================
     elif (front_chasing_evade or (chasing_front_detected and chasing_front_lane == current_lane)) and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active]):
-        print(f"[FRONT CHASING] ⚠️ FRONT CHASING CAR EVASION! Moving out of lane {current_lane}")
-        
         hazard_lanes = {current_lane}
         if chasing_front_lane is not None:
             hazard_lanes.add(chasing_front_lane)
@@ -3118,7 +2725,6 @@ def send_controls_task():
             selected_target_type = "FRONT_CHASING_EVADE"
             acceleration_input = min(acceleration_input, 0.78)
             steering_input = apply_tap_steering(safe_lane)
-            print(f"[FRONT CHASING] Evading to lane {safe_lane}")
             with data_lock:
                 shared_data['target_lane'] = safe_lane
                 shared_data['emergency_evade_lane'] = safe_lane
@@ -3132,7 +2738,6 @@ def send_controls_task():
     # BACK POLICE CAR EVASION (only if no EV is active)
     # =========================================================
     elif police_active and police_lane is not None and police_lane == current_lane and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active]):
-        print(f"[POLICE] ⚠️ Police car in lane {police_lane}! EVADING!")
         safe_lane = get_safe_lane(current_lane, set(), img_w)
         if safe_lane != current_lane:
             desired_lane = safe_lane
@@ -3140,7 +2745,6 @@ def send_controls_task():
             selected_target_type = "POLICE_EVADE"
             acceleration_input = min(acceleration_input, 0.78)
             steering_input = apply_tap_steering(safe_lane)
-            print(f"[POLICE] Evading to lane {safe_lane}")
             with data_lock:
                 shared_data['target_lane'] = safe_lane
                 shared_data['emergency_evade_lane'] = safe_lane
@@ -3150,8 +2754,6 @@ def send_controls_task():
     # BACK TRAILING CAR EVASION (only if no EV is active)
     # =========================================================
     elif trailing_detected and trailing_lane is not None and trailing_lane == current_lane and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active]):
-        print(f"[TRAILING] ⚠️ Trailing car in lane {trailing_lane}! EVADING!")
-        
         safe_lane = get_safe_lane(current_lane, set(), img_w)
         if safe_lane != current_lane:
             desired_lane = safe_lane
@@ -3159,7 +2761,6 @@ def send_controls_task():
             selected_target_type = "TRAILING_EVADE"
             acceleration_input = min(acceleration_input, 0.78)
             steering_input = apply_tap_steering(safe_lane)
-            print(f"[TRAILING] Evading to lane {safe_lane}")
             with data_lock:
                 shared_data['target_lane'] = safe_lane
                 shared_data['emergency_evade_lane'] = safe_lane
@@ -3196,7 +2797,6 @@ def send_controls_task():
                 target_debug = f"police_red:{target_red['x']},{target_red['y']} left:{max(0.0, POLICE_EVENT_TIMEOUT_SECONDS - police_elapsed):.1f}s"
         elif police_elapsed > POLICE_EVENT_TIMEOUT_SECONDS:
             if not red_token_collected:
-                print(f"[POLICE] Time expired! No red token collected. Speed reduced by 50%!")
                 with data_lock:
                     if not shared_data.get('police_penalty_applied', False):
                         shared_data['police_penalty_applied'] = True
@@ -3207,7 +2807,7 @@ def send_controls_task():
             police_debug['active'] = False
             police_debug['reason'] = 'expired'
 
-    # Avoid red/yellow during normal driving. Red is only a target while Police is active.
+    # Avoid red/yellow during normal driving
     hazard_colors = {'yellow'} if police_red_required else {'red', 'yellow'}
     hazard_tokens = [
         t for t in tokens_snapshot
@@ -3222,12 +2822,9 @@ def send_controls_task():
         if t.get('color') == 'yellow' and t['y'] >= HAZARD_AVOID_Y_MIN
     ]
     hazard_lanes = set()
-    close_hazard_lanes = set()
     for t in hazard_tokens:
         t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
         hazard_lanes.add(t_lane)
-        if t['y'] >= GREEN_BLOCKED_HAZARD_Y_MIN:
-            close_hazard_lanes.add(t_lane)
     red_hazard_lanes = set()
     for t in red_hazard_tokens:
         red_hazard_lanes.add(lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h))
@@ -3235,17 +2832,12 @@ def send_controls_task():
     for t in yellow_hazard_tokens:
         yellow_hazard_lanes.add(lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h))
 
-    # Green lanes are useful escape lanes
     green_tokens_for_bonus = [t for t in tokens_snapshot if t.get('color') == 'green' and t['y'] >= TOKEN_DECISION_Y_MIN]
-    bonus_tokens = green_tokens_for_bonus
     bonus_lanes = set()
-    for t in bonus_tokens:
+    for t in green_tokens_for_bonus:
         t_lane = lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h)
         bonus_lanes.add(t_lane)
-    green_tokens_visible = [
-        t for t in tokens_snapshot
-        if t.get('color') == 'green'
-    ]
+    green_tokens_visible = [t for t in tokens_snapshot if t.get('color') == 'green']
     green_reject_counts = {
         'candidate': len(green_tokens_visible),
         'too_far': 0,
@@ -3253,7 +2845,6 @@ def send_controls_task():
         'blocked_by_hazard': 0,
         'event_override': 0,
         'no_lock': 0,
-        'unreachable_lane': 0
     }
     for token in green_tokens_visible:
         reason = green_rejection_reason(token, img_w, img_h, current_lane, hazard_lanes)
@@ -3318,7 +2909,6 @@ def send_controls_task():
             selected_target_type = "GREEN"
             acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
             
-            # Only change steering if not already in emergency mode
             if decision_reason not in ("FRONT_POLICE_EVADE", "FRONT_CHASING_EVADE", "POLICE_EVADE", "TRAILING_EVADE", "EV3_CHASING_EVADE", "EV4_CHASING_EVADE"):
                 steering_input = apply_tap_steering(desired_lane)
 
@@ -3337,7 +2927,7 @@ def send_controls_task():
                 decision_reason = "GREEN_TARGET" if target_y_ratio >= GREEN_COLLECT_Y_RATIO else "PRE_TARGET_GREEN"
                 selected_target_type = "GREEN"
                 acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
-                target_debug = f"green_lock_missing:{locked_green_target_missing_frames}/{GREEN_TARGET_MAX_MISSING_FRAMES} x:{selected_green_target['x']} y:{selected_green_target['y']}"
+                target_debug = f"green_lock_missing:{locked_green_target_missing_frames}/{GREEN_TARGET_MAX_MISSING_FRAMES}"
             else:
                 locked_green_target = None
                 locked_green_target_frames = 0
@@ -3380,7 +2970,6 @@ def send_controls_task():
         "TRAILING_EVADE": "TRAILING CAR AVOID",
         "PRE_TARGET_GREEN": "PRE_TARGET_GREEN",
         "GREEN_TARGET": "COLLECT_GREEN",
-        "GREEN_BLOCKED_AVOID": "AVOID RED",
         "AVOID_RED": "AVOID RED",
         "AVOID_YELLOW": "AVOID YELLOW",
         "LANE_FOLLOW": "LANE FOLLOW"
@@ -3388,6 +2977,8 @@ def send_controls_task():
     
     if ev1_darkness_active:
         current_mode_text = "🌑 EV1: DARKNESS - BRAKE!"
+    elif low_light_active:
+        current_mode_text = "🌑 LOW LIGHT - RECOVERING..."
     elif ev2_police_active:
         current_mode_text = f"🚨 EV2: POLICE - {max(0, 5.0 - (time.time() - shared_data.get('ev2_police_start_time', 0))):.1f}s"
     elif ev3_chasing1_active:
@@ -3493,11 +3084,14 @@ if __name__ == '__main__':
         shared_data['police_detection_history'] = []
         shared_data['police_lane'] = None
         shared_data['trailing_lane'] = None
+        # Light detection confirmation
+        shared_data['light_confirm_count'] = 0
+        shared_data['recovery_confirm_count'] = 0
+        shared_data['last_recovery_burst_time'] = 0.0
         # Front detection initialization
         shared_data['police_front_detected'] = False
         shared_data['police_front_lane'] = None
         shared_data['police_front_confidence'] = 0.0
-        shared_data['police_front_distance'] = None
         shared_data['police_front_bbox'] = None
         shared_data['chasing_front_detected'] = False
         shared_data['chasing_front_lane'] = None
@@ -3542,7 +3136,6 @@ if __name__ == '__main__':
             'police_confidence': 0.0,
             'police_bbox': None,
             'police_lane': None,
-            'police_detection_count': 0
         }
         shared_data['green_target_debug'] = None
         shared_data['green_decision_debug'] = None
@@ -3573,11 +3166,15 @@ if __name__ == '__main__':
     print("  EV3: 🏎️ Chasing Car 1 - Avoid collision (10 seconds)")
     print("  EV4: 🏎️ Chasing Car 2 - Avoid collision (3 seconds)")
     print("  EV5: 🌟 Golden Lane - Be in golden lane when timer expires")
-    print("\nFeatures Implemented:")
-    print("  - Police Car Detection (Split Red/Blue) with Front & Back")
-    print("  - Trailing Car Detection (Cyan/Teal) with Front & Back")
-    print("  - Emergency Lane Evasion for Same-Lane Threats")
-    print("  - Super Fast Light Detection & Recovery")
+    print("\nChallenge 1: Low Light")
+    print("  - Brightness decreases under 50%")
+    print("  - All tokens become Yellow/Unknown")
+    print("  - Player must detect brightness change")
+    print("  - Send acceleration_input = -1.0 to recover light")
+    print("  - Must happen once during first 10 seconds")
+    print("\nCar Detection Logic:")
+    print("  - Police Car: Split Red/Blue color scheme (50% Red, 50% Blue)")
+    print("  - Trailing/Chasing Car: Monochromatic Cyan/Teal color")
     print("\nInitializing...")
     
     threading.Thread(target=setup_control_server, daemon=True).start()
@@ -3635,7 +3232,6 @@ if __name__ == '__main__':
         }
         light_attempts = shared_data.get('recovery_attempts', 0)
         light_recovered = summary.get('light_recovered', False)
-        trailing_count = shared_data.get('trailing_count', 0)
         police_confidence = shared_data.get('police_confidence', 0.0)
         ev2_red_collected = shared_data.get('ev2_red_token_collected', False)
         ev3_evaded = shared_data.get('ev3_chasing1_evaded', False)
@@ -3657,11 +3253,14 @@ if __name__ == '__main__':
         print("\n" + "-"*60)
         print("EVENT STATUS:")
         print("-"*60)
-        print(f"  EV1: Darkness:              {'✅ COMPLETE' if events['ev1'] else '❌ NOT TRIGGERED'}")
+        print(f"  EV1: Darkness (Challenge 1): {'✅ COMPLETE' if events['ev1'] else '❌ NOT TRIGGERED'}")
         print(f"  EV2: Police Car:            {'✅ COMPLETE (Red token collected)' if ev2_red_collected else ('⚠️ ACTIVE' if events['ev2'] else '❌ NOT TRIGGERED')}")
         print(f"  EV3: Chasing Car 1:         {'✅ EVADED' if ev3_evaded else ('⚠️ ACTIVE' if events['ev3'] else '❌ NOT TRIGGERED')}")
         print(f"  EV4: Chasing Car 2:         {'✅ EVADED' if ev4_evaded else ('⚠️ ACTIVE' if events['ev4'] else '❌ NOT TRIGGERED')}")
         print(f"  EV5: Golden Lane:           {'✅ COMPLETE' if events['ev5'] else '❌ NOT TRIGGERED'}")
+        print(f"  Light Recovery:             {'✅ SUCCESS' if light_recovered else '❌ FAILED'}")
+        if light_attempts > 0:
+            print(f"    - Recovery attempts: {light_attempts}")
         print(f"  Police Car (Front):         {'✓ DETECTED' if events['front_police'] else '✗ NOT DETECTED'}")
         print(f"  Chasing Car (Front):        {'✓ DETECTED' if events['front_chasing'] else '✗ NOT DETECTED'}")
         
