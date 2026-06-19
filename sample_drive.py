@@ -30,7 +30,7 @@ TOKEN_SPEED_MIN_MODIFIER = 0.20
 TOKEN_SPEED_MAX_MODIFIER = 1.80
 MAX_ACCELERATION = TOKEN_SPEED_MAX_MODIFIER
 EVENT_SPEED_PENALTY_MULTIPLIER = 0.50
-GREEN_CHASE_ACCELERATION = 0.92
+GREEN_CHASE_ACCELERATION = 0.98
 GREEN_STEER_GAIN = 6.0
 GREEN_STEER_DEADZONE = 0.015
 GREEN_MIN_STEER = 0.18
@@ -47,7 +47,7 @@ LANE_CHANGE_TAP_LOOPS = 18
 LANE_CHANGE_RESET_LOOPS = 2
 TOKEN_TARGET_MEMORY_SECONDS = 2.4
 GREEN_TARGET_LOCK_SECONDS = 2.8
-GREEN_TARGET_LOCK_FRAMES = 18
+GREEN_TARGET_LOCK_FRAMES = 6
 GREEN_TARGET_MAX_MISSING_FRAMES = 5
 GREEN_DECISION_MIN_Y_RATIO = 0.10
 GREEN_PRE_TARGET_MAX_Y_RATIO = 0.75
@@ -1637,7 +1637,7 @@ def green_target_score(token, frame_width, frame_height, current_lane):
     token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width)
     center_error = abs(token['x'] - (frame_width / 2.0)) / (frame_width / 2.0)
     lane_center_error = abs(token['x'] - get_lane_center_x(token_lane, frame_width)) / (frame_width / 5.0)
-    lane_change_cost = abs(token_lane - current_lane) * 0.08
+    lane_change_cost = abs(token_lane - current_lane) * 0.01
     y_ratio = token['y'] / float(frame_height)
     future_bonus = 80.0 if 0.25 <= y_ratio <= 0.75 else 0.0
     return (
