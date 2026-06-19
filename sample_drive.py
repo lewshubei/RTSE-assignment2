@@ -1662,21 +1662,10 @@ def select_green_target(green_tokens, previous_target, frame_width, frame_height
         if len(lane_map.get(locked_lane, [])) > 0:
             target_lane = locked_lane
 
-    # Priority 2: Most productive lane (Streak potential)
+    # Priority 2: Same lane (Stay in lane if productive)
     if target_lane is None:
-        best_count = 0
-        best_lane = None
-        for l, tokens in lane_map.items():
-            count = len(tokens)
-            if count > best_count:
-                best_count = count
-                best_lane = l
-            elif count == best_count and count > 0:
-                if l == current_lane:
-                    best_lane = current_lane
-        
-        if best_lane is not None:
-            target_lane = best_lane
+        if len(lane_map.get(current_lane, [])) > 0:
+            target_lane = current_lane
 
     prev_ny = None
     if previous_target and 'y' in previous_target:
@@ -2743,8 +2732,10 @@ def send_controls_task():
             selected_target_type = "EV5_GOLDEN"
             steering_input = apply_tap_steering(target_lane)
         else:
-            with data_lock:
-                shared_data['ev5_golden_lane_active'] = False
+            decision_reason = "EV5_GOLDEN_LANE"
+            selected_target_type = "EV5_GOLDEN"
+            if steering_state != 0:
+                steering_input = apply_tap_steering(target_lane)
         
         if elapsed > 5.0:
             if current_lane == target_lane:
