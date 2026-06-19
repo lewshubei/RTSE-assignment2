@@ -2967,8 +2967,12 @@ def send_controls_task():
             desired_lane = max(-2, min(2, target_lane))
             decision_reason = "GREEN_TARGET"
             selected_target_type = "GREEN"
-            acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
             
+            if current_lane == desired_lane:
+                acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
+            else:
+                acceleration_input = min(acceleration_input, 0.60)
+                
             if decision_reason not in ("FRONT_POLICE_EVADE", "FRONT_CHASING_EVADE", "POLICE_EVADE", "TRAILING_EVADE", "EV3_CHASING_EVADE", "EV4_CHASING_EVADE"):
                 steering_input = apply_tap_steering(desired_lane)
 
@@ -2998,11 +3002,11 @@ def send_controls_task():
                 target_debug = f"fallback_evade:L{current_lane}->L{safe_lane}"
             else:
                 desired_lane = current_lane
-                decision_reason = "FALLBACK_MAINTAIN"
-                selected_target_type = "FALLBACK"
+                decision_reason = "GREEN_TARGET"
+                selected_target_type = "GREEN"
                 if steering_state != 0:
                     steering_input = apply_tap_steering(desired_lane)
-                target_debug = f"fallback_maintain:L{current_lane}"
+                target_debug = f"green_target_maintain:L{current_lane}"
 
     if decision_reason != "GREEN_TARGET" and locked_green_target_frames > 0:
         locked_green_target_frames = 0
@@ -3012,7 +3016,7 @@ def send_controls_task():
     # =========================================================
     # LANE FOLLOWING (fallback)
     # =========================================================
-    if decision_reason in ("MAINTAIN", "FALLBACK_MAINTAIN") and steering_state == 0:
+    if decision_reason == "MAINTAIN" and steering_state == 0:
         lane_center_x = lane_follow.get('lane_center_x')
         if lane_follow.get('valid') and lane_center_x is not None:
             steering_input = float(lane_follow.get('smoothed_steering', 0.0))
@@ -3042,7 +3046,6 @@ def send_controls_task():
         "AVOID_RED": "AVOID RED",
         "AVOID_YELLOW": "AVOID YELLOW",
         "FALLBACK_AVOID_HAZARD": "FALLBACK AVOID",
-        "FALLBACK_MAINTAIN": "FALLBACK MAINTAIN",
         "LANE_FOLLOW": "LANE FOLLOW"
     }
     
