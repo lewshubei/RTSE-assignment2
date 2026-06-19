@@ -2005,7 +2005,8 @@ def processing_task():
             
             with data_lock:
                 # Store front detections
-                shared_data['police_front_detected'] = police_front and police_front_conf >= 0.60 and ev2_window
+                ev2_already_done = shared_data.get('ev2_red_token_collected', False)
+                shared_data['police_front_detected'] = police_front and police_front_conf >= 0.60 and ev2_window and not ev2_already_done
                 shared_data['police_front_lane'] = police_front_lane
                 shared_data['police_front_confidence'] = police_front_conf
                 shared_data['police_front_bbox'] = police_front_bbox
@@ -2017,7 +2018,7 @@ def processing_task():
                 
                 # EV2: Police car detection - require consistent detection
                 police_history = shared_data.get('police_detection_history', [])
-                if police_front and police_front_conf >= 0.60 and ev2_window:
+                if police_front and police_front_conf >= 0.60 and ev2_window and not ev2_already_done:
                     police_history.append(1)
                     if len(police_history) > 5:
                         police_history.pop(0)
@@ -2062,7 +2063,7 @@ def processing_task():
                         shared_data['trailing_detected'] = False
             
             # If police car detected in front and in same lane, EVADE IMMEDIATELY!
-            if ev2_window and police_front and police_front_conf >= 0.60 and police_front_lane == current_lane:
+            if ev2_window and not ev2_already_done and police_front and police_front_conf >= 0.60 and police_front_lane == current_lane:
                 print(f"[EV2] ⚠️ Police car in lane {police_front_lane}! EVADING IMMEDIATELY!")
                 with data_lock:
                     shared_data['front_police_evade'] = True
@@ -2318,15 +2319,16 @@ def processing_task():
                     police_confirmed = sum(police_history) >= (POLICE_CONFIRM_FRAMES * 0.7)
                     trailing_confirmed = shared_data['trailing_streak'] >= TRAILING_CONFIRM_FRAMES
                     
-                    if police_confirmed and ev2_window:
+                    ev2_already_done = shared_data.get('ev2_red_token_collected', False)
+                    if police_confirmed and ev2_window and not ev2_already_done:
                         shared_data['police_lane'] = police_lane
                     
                     shared_data['trailing_detected'] = trailing_confirmed and (ev3_window or ev4_window)
-                    shared_data['police_detected'] = police_confirmed and ev2_window
-                    shared_data['danger_detected'] = (trailing_confirmed and (ev3_window or ev4_window)) or (police_confirmed and ev2_window)
+                    shared_data['police_detected'] = police_confirmed and ev2_window and not ev2_already_done
+                    shared_data['danger_detected'] = (trailing_confirmed and (ev3_window or ev4_window)) or (police_confirmed and ev2_window and not ev2_already_done)
                     shared_data['police_confidence'] = police_confidence if police_raw else shared_data.get('police_confidence', 0.0)
                     
-                    if police_confirmed and ev2_window:
+                    if police_confirmed and ev2_window and not ev2_already_done:
                         shared_data['run_summary']['police_appeared'] = True
                         if not shared_data.get('ev2_police_active', False) and not shared_data.get('ev2_red_token_collected', False) and shared_data.get('ev2_police_cycle', -1) != event_cycle_index():
                             shared_data['ev2_police_active'] = True
@@ -2558,33 +2560,10 @@ def send_controls_task():
                 shared_data['ev5_golden_lane_cycle'] = current_event_cycle
     
     # =========================================================
-    # EV1: DARKNESS - HIGHEST PRIORITY - Brake fully!
-    # Challenge 1: Low Light - Send acceleration_input = -1.0
-    # =========================================================
-    if ev1_darkness_active:
-        steering_input = 0.0
-        acceleration_input = -1.0  # Full brake as required by Challenge 1
-        decision_reason = "EV1_DARKNESS"
-        selected_target_type = "EV1_DARKNESS"
-        with data_lock:
-            shared_data['ev1_darkness_brake_sent'] = True
-            shared_data['steering_input'] = steering_input
-            shared_data['acceleration_input'] = acceleration_input
-            shared_data['speed_modifier'] = speed_modifier
-            shared_data['selected_target_type'] = 'EV1_DARKNESS'
-            shared_data['current_mode'] = 'EV1_DARKNESS'
-        try:
-            send_control_packet(steering_input, acceleration_input)
-        except Exception as e:
-            print(f"Network error: {e}")
-            control_conn = None
-        return
-
-    # =========================================================
     # SUPER FAST LIGHT RECOVERY - ENHANCED
     # Challenge 1: Send acceleration_input = -1.0 to recover light
     # =========================================================
-    if low_light_active and not ev1_darkness_active:
+    if low_light_active or ev1_darkness_active:
         with data_lock:
             recovery_sent = shared_data.get('low_light_recovery_sent', False)
             last_recovery_time = shared_data.get('last_recovery_time', 0.0)
@@ -2628,22 +2607,11 @@ def send_controls_task():
             print(f"[LIGHT] ⚡ FAST RECOVERY BURST (attempt {recovery_attempts + 1})")
             print(f"[LIGHT] Sending acceleration_input = -1.0 to recover light!")
             
-            # Send multiple recovery packets in quick succession
-            for i in range(LOWLIGHT_FAST_RECOVERY_COUNT):
-                try:
-                    send_control_packet(0.0, -1.0)
-                    time.sleep(0.02)  # Very fast between packets
-                except Exception:
-                    pass
-            
-            # Send an extra burst for good measure
-            time.sleep(0.02)
-            for i in range(3):
-                try:
-                    send_control_packet(0.0, -1.0)
-                    time.sleep(0.01)
-                except Exception:
-                    pass
+            send_fast_recovery_burst()
+            try:
+                control_conn.sendall(struct.pack('ff', 0.0, -1.0))
+            except Exception:
+                pass
             
             print(f"[LIGHT] ✅ Recovery burst sent! Waiting for light to restore...")
             return
@@ -2660,7 +2628,7 @@ def send_controls_task():
             shared_data['ev1_darkness_active'] = True
         
         try:
-            send_control_packet(steering_input, acceleration_input)
+            control_conn.sendall(struct.pack('ff', steering_input, acceleration_input))
         except Exception as e:
             print(f"Network error: {e}")
             control_conn = None
@@ -2706,14 +2674,22 @@ def send_controls_task():
                     shared_data['ev2_red_token_collected'] = True
                     shared_data['red_token_collected_during_police'] = True
                     shared_data['ev2_police_active'] = False
+                    shared_data['police_detected'] = False
+                    shared_data['police_active'] = False
+                    shared_data['front_police_evade'] = False
+                    shared_data['police_detection_history'] = []
                     shared_data['run_summary']['red_collected'] += 1
                 ev2_police_active = False
                 ev2_red_collected = True
+                police_detected = False
+                police_active = False
+                police_red_required = False
+                front_police_evade = False
                 locked_green_target = None
                 locked_green_target_frames = 0
                 locked_green_target_missing_frames = 0
-                decision_reason = "EV2_RED_COLLECTED"
-                selected_target_type = "EV2_COMPLETE"
+                decision_reason = "MAINTAIN"
+                selected_target_type = "NONE"
                 target_debug = "ev2_red_collected:return_green"
         else:
             if police_front_detected and police_front_lane == current_lane:
