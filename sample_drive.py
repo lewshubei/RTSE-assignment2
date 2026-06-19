@@ -1609,6 +1609,9 @@ def clamp(value, min_value, max_value):
 def green_rejection_reason(token, frame_width, frame_height, current_lane, blocked_lanes):
     if token.get('color') != 'green':
         return "not_green"
+    token_lane = lane_from_x(token['x'], token['y'], frame_width=frame_width, frame_height=frame_height)
+    if token_lane in blocked_lanes:
+        return "blocked_by_hazard"
     return None
 
 def is_reachable_green_token(token, frame_width, frame_height, current_lane, blocked_lanes):
@@ -2940,7 +2943,7 @@ def send_controls_task():
     # =========================================================
     # TOKEN DECISION - Seek reachable GREEN tokens (only if no EV is active)
     # =========================================================
-    if decision_reason == "MAINTAIN" and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active, ev5_golden_lane_active]):
+    if decision_reason in ("MAINTAIN", "AVOID_RED", "AVOID_YELLOW") and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active, ev5_golden_lane_active]):
         selected_green_target, reachable_green_tokens = select_green_target(
             green_tokens_visible,
             locked_green_target,
