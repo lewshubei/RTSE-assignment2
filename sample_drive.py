@@ -2934,6 +2934,25 @@ def send_controls_task():
                 locked_green_target_missing_frames = 0
                 green_reject_counts['no_lock'] = len(green_tokens_visible)
 
+                # =========================================================
+                # GLOBAL FALLBACK POLICY
+                # =========================================================
+                safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
+                if safe_lane != current_lane:
+                    desired_lane = safe_lane
+                    decision_reason = "FALLBACK_AVOID_HAZARD"
+                    selected_target_type = "FALLBACK"
+                    acceleration_input = min(acceleration_input, 0.85)
+                    steering_input = apply_tap_steering(desired_lane)
+                    target_debug = f"fallback_evade:L{current_lane}->L{safe_lane}"
+                else:
+                    desired_lane = current_lane
+                    decision_reason = "FALLBACK_MAINTAIN"
+                    selected_target_type = "FALLBACK"
+                    if steering_state != 0:
+                        steering_input = apply_tap_steering(desired_lane)
+                    target_debug = f"fallback_maintain:L{current_lane}"
+
     if decision_reason not in ("GREEN_TARGET", "PRE_TARGET_GREEN") and locked_green_target_frames > 0:
         locked_green_target_frames = 0
         locked_green_target = None
@@ -2942,7 +2961,7 @@ def send_controls_task():
     # =========================================================
     # LANE FOLLOWING (fallback)
     # =========================================================
-    if decision_reason == "MAINTAIN" and steering_state == 0:
+    if decision_reason in ("MAINTAIN", "FALLBACK_MAINTAIN") and steering_state == 0:
         lane_center_x = lane_follow.get('lane_center_x')
         if lane_follow.get('valid') and lane_center_x is not None:
             steering_input = float(lane_follow.get('smoothed_steering', 0.0))
@@ -2972,6 +2991,8 @@ def send_controls_task():
         "GREEN_TARGET": "COLLECT_GREEN",
         "AVOID_RED": "AVOID RED",
         "AVOID_YELLOW": "AVOID YELLOW",
+        "FALLBACK_AVOID_HAZARD": "FALLBACK AVOID",
+        "FALLBACK_MAINTAIN": "FALLBACK MAINTAIN",
         "LANE_FOLLOW": "LANE FOLLOW"
     }
     
