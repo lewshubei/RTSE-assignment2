@@ -849,18 +849,11 @@ def draw_light_debug_overlay(frame, tokens, current_mode):
     if green_target_debug:
         target_x = int(green_target_debug.get('x', frame_w // 2))
         target_y = int(green_target_debug.get('y', frame_h // 2))
-        car_center = (frame_w // 2, int(frame_h * 0.92))
         target_center = (
             max(0, min(frame_w - 1, target_x)),
             max(0, min(frame_h - 1, target_y))
         )
-        cv2.line(frame, car_center, target_center, (0, 255, 0), 2)
-        cv2.circle(frame, target_center, 7, (0, 255, 0), 2)
-        cv2.putText(frame, "GREEN TARGET", (target_center[0], max(18, target_center[1] - 22)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
         predicted_x = int(green_target_debug.get('predicted_x', target_center[0]))
-        cv2.putText(frame, f"x:{target_center[0]} y:{target_center[1]} pred:{predicted_x}", (target_center[0], max(36, target_center[1] - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
     if hazard_debug:
         for hazard in hazard_debug.get('tokens', []):
@@ -2873,10 +2866,9 @@ def send_controls_task():
     # TOKEN DECISION - Seek reachable GREEN tokens (only if no EV is active)
     # =========================================================
     if decision_reason == "MAINTAIN" and not any([ev1_darkness_active, ev2_police_active, ev3_chasing1_active, ev4_chasing2_active, ev5_golden_lane_active]):
-        previous_target = locked_green_target if locked_green_target_frames > 0 else None
         selected_green_target, reachable_green_tokens = select_green_target(
             green_tokens_visible,
-            previous_target,
+            None,
             img_w,
             img_h,
             current_lane,
@@ -2884,19 +2876,6 @@ def send_controls_task():
         )
 
         if selected_green_target is not None:
-            target_is_locked = False
-            if previous_target:
-                dx = selected_green_target['x'] - previous_target.get('x', selected_green_target['x'])
-                dy = selected_green_target['y'] - previous_target.get('y', selected_green_target['y'])
-                lock_radius = max(45.0, img_w * 0.11)
-                target_is_locked = (dx * dx + dy * dy) <= lock_radius * lock_radius
-
-            locked_green_target = dict(selected_green_target)
-            if target_is_locked:
-                locked_green_target_frames = max(1, locked_green_target_frames - 1)
-            else:
-                locked_green_target_frames = GREEN_TARGET_LOCK_FRAMES
-            locked_green_target_missing_frames = 0
             target_lane = lane_from_x(
                 selected_green_target['x'],
                 selected_green_target['y'],
@@ -2914,39 +2893,24 @@ def send_controls_task():
 
             target_debug = (
                 f"green_target:{selected_green_target['x']},{selected_green_target['y']} "
-                f"reach:{len(reachable_green_tokens)} lock:{locked_green_target_frames}"
+                f"reach:{len(reachable_green_tokens)}"
             )
         else:
-            if previous_target and green_rejection_reason(previous_target, img_w, img_h, current_lane, hazard_lanes) is None and locked_green_target_missing_frames < GREEN_TARGET_MAX_MISSING_FRAMES:
-                locked_green_target_missing_frames += 1
-                locked_green_target_frames = max(1, locked_green_target_frames - 1)
-                selected_green_target = dict(previous_target)
-                target_lane = lane_from_x(selected_green_target['x'], selected_green_target['y'], frame_width=img_w, frame_height=img_h)
-                desired_lane = max(-2, min(2, target_lane))
-                target_y_ratio = selected_green_target['y'] / float(img_h)
-                decision_reason = "GREEN_TARGET" if target_y_ratio >= GREEN_COLLECT_Y_RATIO else "PRE_TARGET_GREEN"
-                selected_target_type = "GREEN"
-                acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
-                target_debug = f"green_lock_missing:{locked_green_target_missing_frames}/{GREEN_TARGET_MAX_MISSING_FRAMES}"
-            else:
-                locked_green_target = None
-                locked_green_target_frames = 0
-                locked_green_target_missing_frames = 0
-                green_reject_counts['no_lock'] = len(green_tokens_visible)
+            green_reject_counts['no_lock'] = len(green_tokens_visible)
 
-                # =========================================================
-                # GLOBAL FALLBACK POLICY
-                # =========================================================
-                safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
-                if safe_lane != current_lane:
-                    desired_lane = safe_lane
-                    decision_reason = "FALLBACK_AVOID_HAZARD"
-                    selected_target_type = "FALLBACK"
-                    acceleration_input = min(acceleration_input, 0.85)
-                    steering_input = apply_tap_steering(desired_lane)
-                    target_debug = f"fallback_evade:L{current_lane}->L{safe_lane}"
-                else:
-                    desired_lane = current_lane
+            # =========================================================
+            # GLOBAL FALLBACK POLICY
+            # =========================================================
+            safe_lane = get_safe_lane(current_lane, hazard_lanes, img_w, bonus_lanes)
+            if safe_lane != current_lane:
+                desired_lane = safe_lane
+                decision_reason = "FALLBACK_AVOID_HAZARD"
+                selected_target_type = "FALLBACK"
+                acceleration_input = min(acceleration_input, 0.85)
+                steering_input = apply_tap_steering(desired_lane)
+                target_debug = f"fallback_evade:L{current_lane}->L{safe_lane}"
+            else:
+                desired_lane = current_lane
                     decision_reason = "FALLBACK_MAINTAIN"
                     selected_target_type = "FALLBACK"
                     if steering_state != 0:
