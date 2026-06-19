@@ -62,7 +62,7 @@ GREEN_PREDICTION_GAIN = 0.45
 YELLOW_EFFECT_DURATION_SECONDS = 5.0
 TOKEN_COLLECTION_Y_RATIO = 0.90
 TOKEN_COLLECTION_COOLDOWN_SECONDS = 2.0
-HAZARD_AVOID_Y_MIN = 95
+HAZARD_AVOID_Y_MIN = 35
 GREEN_BLOCKED_HAZARD_Y_MIN = 230
 MIN_ACCELERATION_WHEN_SLOWED = 0.60
 MIN_STEERING_ACCELERATION = 0.56
@@ -2381,19 +2381,16 @@ def send_controls_task():
         police_debug['reason'] = 'waiting_until_timeout'
         
         if police_red_required and red_tokens_police:
-            target_red = max(red_tokens_police, key=lambda t: (t['y'], -abs(t['x'] - (img_w / 2.0))))
-            red_lane = lane_from_x(target_red['x'], target_red['y'], frame_width=img_w, frame_height=img_h)
-            desired_lane = max(-2, min(2, red_lane))
-            decision_reason = "POLICE_RED_TOKEN"
-            selected_target_type = "RED"
-            acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
-            police_debug['reason'] = 'near_timeout_target_red'
-            target_debug = f"police_red:{target_red['x']},{target_red['y']} left:{max(0.0, POLICE_EVENT_TIMEOUT_SECONDS - police_elapsed):.1f}s"
-            
-            # If red token is in a different lane, change lanes
-            if red_lane != current_lane:
-                steering_input = apply_tap_steering(red_lane)
-                print(f"[POLICE] Moving to lane {red_lane} to collect red token")
+            valid_red_tokens = [t for t in red_tokens_police if lane_from_x(t['x'], t['y'], frame_width=img_w, frame_height=img_h) != police_lane]
+            if valid_red_tokens:
+                target_red = max(valid_red_tokens, key=lambda t: (t['y'], -abs(t['x'] - (img_w / 2.0))))
+                red_lane = lane_from_x(target_red['x'], target_red['y'], frame_width=img_w, frame_height=img_h)
+                desired_lane = max(-2, min(2, red_lane))
+                decision_reason = "POLICE_RED_TOKEN"
+                selected_target_type = "RED"
+                acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
+                police_debug['reason'] = 'near_timeout_target_red'
+                target_debug = f"police_red:{target_red['x']},{target_red['y']} left:{max(0.0, POLICE_EVENT_TIMEOUT_SECONDS - police_elapsed):.1f}s"
         elif police_elapsed > POLICE_EVENT_TIMEOUT_SECONDS:
             if not red_token_collected:
                 print(f"[POLICE] Time expired! No red token collected. Speed reduced by 50%!")
