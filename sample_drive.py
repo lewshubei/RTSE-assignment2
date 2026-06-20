@@ -103,16 +103,16 @@ LOWLIGHT_CONFIRM_FRAMES = 3  # Fewer frames to confirm darkness
 LOWLIGHT_RECOVERY_FRAMES = 2  # Fewer frames to confirm recovery
 
 # Police car detection - Based on split red/blue color scheme
-POLICE_CONFIRM_FRAMES = 5
+POLICE_CONFIRM_FRAMES = 2
 POLICE_SEEK_ACCELERATION = 0.70
-POLICE_MIN_AREA = 1500
+POLICE_MIN_AREA = 500
 POLICE_MAX_AREA = 60000
 POLICE_MIN_RED_RATIO = 0.15
 POLICE_MIN_BLUE_RATIO = 0.15
 POLICE_SPLIT_RATIO_MIN = 0.30
 POLICE_SPLIT_RATIO_MAX = 0.70
-POLICE_MIN_RED_PIXELS = 300
-POLICE_MIN_BLUE_PIXELS = 300
+POLICE_MIN_RED_PIXELS = 100
+POLICE_MIN_BLUE_PIXELS = 100
 POLICE_CONFIDENCE_THRESHOLD = 0.65
 POLICE_EVENT_TIMEOUT_SECONDS = 5.0  # EV2: 5 seconds to collect red token
 
@@ -1316,7 +1316,7 @@ def detect_police_car(frame):
     total_blue_pixels = cv2.countNonZero(blue_mask)
     
     # Require significant amounts of both colors
-    if total_red_pixels < 300 or total_blue_pixels < 300:
+    if total_red_pixels < POLICE_MIN_RED_PIXELS or total_blue_pixels < POLICE_MIN_BLUE_PIXELS:
         return False, 0.0, None, None
     
     # Find red regions
@@ -1324,7 +1324,7 @@ def detect_police_car(frame):
     red_regions = []
     for cnt in red_contours:
         area = cv2.contourArea(cnt)
-        if area > 200:
+        if area > 100:
             x, y, w, h = cv2.boundingRect(cnt)
             if 0.3 <= w / max(1, h) <= 4.0:
                 red_regions.append((x, y, w, h, area))
@@ -1334,7 +1334,7 @@ def detect_police_car(frame):
     blue_regions = []
     for cnt in blue_contours:
         area = cv2.contourArea(cnt)
-        if area > 200:
+        if area > 100:
             x, y, w, h = cv2.boundingRect(cnt)
             if 0.3 <= w / max(1, h) <= 4.0:
                 blue_regions.append((x, y, w, h, area))
