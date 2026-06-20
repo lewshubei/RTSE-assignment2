@@ -2485,7 +2485,7 @@ def send_controls_task():
     # =========================================================
     if ev1_darkness_active:
         steering_input = 0.0
-#         acceleration_input = -1.0  # Full brake as required by Challenge 1
+        acceleration_input = -1.0  # Full brake as required by Challenge 1
         decision_reason = "EV1_DARKNESS"
         selected_target_type = "EV1_DARKNESS"
         with data_lock:
@@ -2533,7 +2533,7 @@ def send_controls_task():
         # Send recovery burst - FAST!
         if not recovery_sent or time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
             steering_input = 0.0
-#             acceleration_input = -1.0  # Challenge 1: Send acceleration_input = -1.0
+            acceleration_input = -1.0  # Challenge 1: Send acceleration_input = -1.0
             
             with data_lock:
                 shared_data['low_light_recovery_sent'] = True
@@ -2572,7 +2572,7 @@ def send_controls_task():
         
         # Continue sending brake signal if still dark
         steering_input = 0.0
-#         acceleration_input = -1.0  # Keep braking until recovered
+        acceleration_input = -1.0  # Keep braking until recovered
         with data_lock:
             shared_data['steering_input'] = steering_input
             shared_data['acceleration_input'] = acceleration_input
