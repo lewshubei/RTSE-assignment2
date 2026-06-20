@@ -1866,9 +1866,9 @@ def send_control_packet(steering_input, acceleration_input):
     control_conn.sendall(delayed_data)
 
 def calculate_speed_modifier(green_count, red_count, penalty_count):
-    token_modifier = 1.0 + (green_count * 0.10) - (red_count * 0.20)
+    token_modifier = 1.0 + (green_count * 0.10)
     token_modifier = max(TOKEN_SPEED_MIN_MODIFIER, min(TOKEN_SPEED_MAX_MODIFIER, token_modifier))
-    return token_modifier * (EVENT_SPEED_PENALTY_MULTIPLIER ** penalty_count)
+    return token_modifier
 
 def apply_tap_steering(desired_lane):
     global current_lane, steering_state, tap_loop_count, committed_target_lane
@@ -2312,7 +2312,7 @@ def processing_task():
                     police_elapsed = time.time() - shared_data.get('ev2_police_start_time', 0)
                     if police_elapsed > 5.0:
                         if not shared_data.get('ev2_red_token_collected', False):
-                            print(f"[EV2] ❌ Time expired! No red token collected. Speed reduced by 50%!")
+                            print(f"[EV2] ❌ Time expired! No red token collected.")
                             if not shared_data.get('ev2_police_penalty', False):
                                 shared_data['ev2_police_penalty'] = True
                                 shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
@@ -2323,7 +2323,7 @@ def processing_task():
                     ev3_elapsed = time.time() - shared_data.get('ev3_chasing1_start_time', 0)
                     if ev3_elapsed > 10.0:
                         if not shared_data.get('ev3_chasing1_evaded', False):
-                            print(f"[EV3] ❌ Time expired! Speed reduced by 50%!")
+                            print(f"[EV3] ❌ Time expired!")
                             if not shared_data.get('trailing_first_penalty_applied', False):
                                 shared_data['trailing_first_penalty_applied'] = True
                                 shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
@@ -2334,7 +2334,7 @@ def processing_task():
                     ev4_elapsed = time.time() - shared_data.get('ev4_chasing2_start_time', 0)
                     if ev4_elapsed > 3.0:
                         if not shared_data.get('ev4_chasing2_evaded', False):
-                            print(f"[EV4] ❌ Time expired! Speed reduced by 50%!")
+                            print(f"[EV4] ❌ Time expired!")
                             if not shared_data.get('trailing_second_penalty_applied', False):
                                 shared_data['trailing_second_penalty_applied'] = True
                                 shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
@@ -2452,7 +2452,7 @@ def send_controls_task():
     predicted_green_x = None
     selected_target_type = "NONE"
     hazard_debug_tokens = []
-    speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
+    speed_modifier = 1.0
     police_elapsed = time.time() - shared_data.get('police_start_time', 0.0) if police_active else 0.0
     police_red_required = police_active and police_elapsed >= POLICE_RED_TARGET_START_SECONDS
     police_debug = {
@@ -2485,7 +2485,7 @@ def send_controls_task():
     # =========================================================
     if ev1_darkness_active:
         steering_input = 0.0
-        acceleration_input = -1.0  # Full brake as required by Challenge 1
+#         acceleration_input = -1.0  # Full brake as required by Challenge 1
         decision_reason = "EV1_DARKNESS"
         selected_target_type = "EV1_DARKNESS"
         with data_lock:
@@ -2533,7 +2533,7 @@ def send_controls_task():
         # Send recovery burst - FAST!
         if not recovery_sent or time_since_recovery > LOWLIGHT_RECOVERY_INTERVAL:
             steering_input = 0.0
-            acceleration_input = -1.0  # Challenge 1: Send acceleration_input = -1.0
+#             acceleration_input = -1.0  # Challenge 1: Send acceleration_input = -1.0
             
             with data_lock:
                 shared_data['low_light_recovery_sent'] = True
@@ -2572,7 +2572,7 @@ def send_controls_task():
         
         # Continue sending brake signal if still dark
         steering_input = 0.0
-        acceleration_input = -1.0  # Keep braking until recovered
+#         acceleration_input = -1.0  # Keep braking until recovered
         with data_lock:
             shared_data['steering_input'] = steering_input
             shared_data['acceleration_input'] = acceleration_input
@@ -2607,7 +2607,7 @@ def send_controls_task():
             desired_lane = red_lane
             decision_reason = "EV2_RED_TOKEN"
             selected_target_type = "RED"
-            acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
+#             acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
             
             if police_front_detected and police_front_lane == current_lane:
                 safe_lane = get_safe_lane(current_lane, {current_lane, police_front_lane}, img_w)
@@ -2638,7 +2638,7 @@ def send_controls_task():
                     shared_data['ev2_police_penalty'] = True
                     shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
                     speed_penalties += 1
-                    speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
+                    speed_modifier = 1.0
             shared_data['ev2_police_active'] = False
 
     # =========================================================
@@ -2661,7 +2661,7 @@ def send_controls_task():
                 with data_lock:
                     shared_data['ev3_chasing1_evaded'] = True
             else:
-                acceleration_input = min(acceleration_input, 0.4)
+#                 acceleration_input = min(acceleration_input, 0.4)
                 decision_reason = "EV3_CHASING_BRAKE"
         else:
             with data_lock:
@@ -2675,7 +2675,7 @@ def send_controls_task():
                     shared_data['trailing_first_penalty_applied'] = True
                     shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
                     speed_penalties += 1
-                    speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
+                    speed_modifier = 1.0
             shared_data['ev3_chasing1_active'] = False
 
     # =========================================================
@@ -2698,7 +2698,7 @@ def send_controls_task():
                 with data_lock:
                     shared_data['ev4_chasing2_evaded'] = True
             else:
-                acceleration_input = min(acceleration_input, 0.3)
+#                 acceleration_input = min(acceleration_input, 0.3)
                 decision_reason = "EV4_CHASING_BRAKE"
         else:
             with data_lock:
@@ -2712,7 +2712,7 @@ def send_controls_task():
                     shared_data['trailing_second_penalty_applied'] = True
                     shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
                     speed_penalties += 1
-                    speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
+                    speed_modifier = 1.0
             shared_data['ev4_chasing2_active'] = False
 
     # =========================================================
@@ -2759,7 +2759,7 @@ def send_controls_task():
             desired_lane = safe_lane
             decision_reason = "FRONT_POLICE_EVADE"
             selected_target_type = "FRONT_POLICE_EVADE"
-            acceleration_input = min(acceleration_input, 0.70)
+#             acceleration_input = min(acceleration_input, 0.70)
             steering_input = apply_tap_steering(safe_lane)
             with data_lock:
                 shared_data['target_lane'] = safe_lane
@@ -2767,7 +2767,7 @@ def send_controls_task():
                 shared_data['emergency_evade_until'] = time.time() + 3.0
                 shared_data['front_police_evade'] = False
         else:
-            acceleration_input = 0.3
+#             acceleration_input = 0.3
             decision_reason = "FRONT_POLICE_BRAKE"
 
     # =========================================================
@@ -2784,7 +2784,7 @@ def send_controls_task():
             desired_lane = safe_lane
             decision_reason = "FRONT_CHASING_EVADE"
             selected_target_type = "FRONT_CHASING_EVADE"
-            acceleration_input = min(acceleration_input, 0.78)
+#             acceleration_input = min(acceleration_input, 0.78)
             steering_input = apply_tap_steering(safe_lane)
             with data_lock:
                 shared_data['target_lane'] = safe_lane
@@ -2792,7 +2792,7 @@ def send_controls_task():
                 shared_data['emergency_evade_until'] = time.time() + 2.0
                 shared_data['front_chasing_evade'] = False
         else:
-            acceleration_input = 0.4
+#             acceleration_input = 0.4
             decision_reason = "FRONT_CHASING_BRAKE"
 
     # =========================================================
@@ -2804,7 +2804,7 @@ def send_controls_task():
             desired_lane = safe_lane
             decision_reason = "POLICE_EVADE"
             selected_target_type = "POLICE_EVADE"
-            acceleration_input = min(acceleration_input, 0.78)
+#             acceleration_input = min(acceleration_input, 0.78)
             steering_input = apply_tap_steering(safe_lane)
             with data_lock:
                 shared_data['target_lane'] = safe_lane
@@ -2820,7 +2820,7 @@ def send_controls_task():
             desired_lane = safe_lane
             decision_reason = "TRAILING_EVADE"
             selected_target_type = "TRAILING_EVADE"
-            acceleration_input = min(acceleration_input, 0.78)
+#             acceleration_input = min(acceleration_input, 0.78)
             steering_input = apply_tap_steering(safe_lane)
             with data_lock:
                 shared_data['target_lane'] = safe_lane
@@ -2853,7 +2853,7 @@ def send_controls_task():
                 desired_lane = max(-2, min(2, red_lane))
                 decision_reason = "POLICE_RED_TOKEN"
                 selected_target_type = "RED"
-                acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
+#                 acceleration_input = min(acceleration_input, POLICE_SEEK_ACCELERATION)
                 police_debug['reason'] = 'near_timeout_target_red'
                 target_debug = f"police_red:{target_red['x']},{target_red['y']} left:{max(0.0, POLICE_EVENT_TIMEOUT_SECONDS - police_elapsed):.1f}s"
         elif police_elapsed > POLICE_EVENT_TIMEOUT_SECONDS:
@@ -2863,7 +2863,7 @@ def send_controls_task():
                         shared_data['police_penalty_applied'] = True
                         shared_data['run_summary']['speed_penalties'] = shared_data['run_summary'].get('speed_penalties', 0) + 1
                         speed_penalties += 1
-                        speed_modifier = calculate_speed_modifier(green_streak, red_streak, speed_penalties)
+                        speed_modifier = 1.0
             shared_data['police_active'] = False
             police_debug['active'] = False
             police_debug['reason'] = 'expired'
@@ -2921,7 +2921,7 @@ def send_controls_task():
             decision_reason = "AVOID_RED"
             selected_target_type = "AVOID_RED"
             hazard_debug_tokens = red_hazard_tokens
-            acceleration_input = min(acceleration_input, 0.80)
+#             acceleration_input = min(acceleration_input, 0.80)
             steering_input = apply_tap_steering(desired_lane)
         elif steering_state != 0:
             decision_reason = "AVOID_RED"
@@ -2936,7 +2936,7 @@ def send_controls_task():
             decision_reason = "AVOID_YELLOW"
             selected_target_type = "AVOID_YELLOW"
             hazard_debug_tokens = yellow_hazard_tokens
-            acceleration_input = min(acceleration_input, 0.80)
+#             acceleration_input = min(acceleration_input, 0.80)
             steering_input = apply_tap_steering(desired_lane)
         elif steering_state != 0:
             decision_reason = "AVOID_YELLOW"
@@ -2971,9 +2971,11 @@ def send_controls_task():
             selected_target_type = "GREEN"
             
             if current_lane == desired_lane:
-                acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
+                # acceleration_input = max(acceleration_input, GREEN_CHASE_ACCELERATION)
+                pass
             else:
-                acceleration_input = min(acceleration_input, 0.60)
+                # acceleration_input = min(acceleration_input, 0.60)
+                pass
                 
             if decision_reason not in ("FRONT_POLICE_EVADE", "FRONT_CHASING_EVADE", "POLICE_EVADE", "TRAILING_EVADE", "EV3_CHASING_EVADE", "EV4_CHASING_EVADE"):
                 steering_input = apply_tap_steering(desired_lane)
@@ -2999,7 +3001,7 @@ def send_controls_task():
                 desired_lane = safe_lane
                 decision_reason = "FALLBACK_AVOID_HAZARD"
                 selected_target_type = "FALLBACK"
-                acceleration_input = min(acceleration_input, 0.85)
+#                 acceleration_input = min(acceleration_input, 0.85)
                 steering_input = apply_tap_steering(desired_lane)
                 target_debug = f"fallback_evade:L{current_lane}->L{safe_lane}"
             else:
